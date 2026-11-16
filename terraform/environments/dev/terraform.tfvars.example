@@ -1,0 +1,5 @@
+project_id     = "cil-dev-sample-01"
+region         = "europe-west2"
+backend_image  = "europe-west2-docker.pkg.dev/cil-dev-sample-01/cil-repo/backend:latest"
+frontend_image = "europe-west2-docker.pkg.dev/cil-dev-sample-01/cil-repo/frontend:latest"
+
