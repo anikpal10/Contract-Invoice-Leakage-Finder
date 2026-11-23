@@ -6,6 +6,7 @@ from backend.app.models.base import TimestampMixin, generate_uuid
 
 class FindingCategory(str, enum.Enum):
     CONTRACT_PRICE_MISMATCH = "CONTRACT_PRICE_MISMATCH"
+    POTENTIAL_UNDERCHARGE = "POTENTIAL_UNDERCHARGE"
     PO_PRICE_MISMATCH = "PO_PRICE_MISMATCH"
     QUANTITY_OVER_PO = "QUANTITY_OVER_PO"
     QUANTITY_OVER_GRN = "QUANTITY_OVER_GRN"
@@ -45,7 +46,7 @@ class Finding(Base, TimestampMixin):
     expected_amount = Column(Numeric(18, 4), nullable=False)
     invoiced_amount = Column(Numeric(18, 4), nullable=False)
     potential_difference = Column(Numeric(18, 4), nullable=False)
-    currency = Column(String(10), default="GBP", nullable=False)
+    currency = Column(String(20), default="REVIEW_REQUIRED", nullable=False)
 
     severity = Column(String(50), default=Severity.HIGH.value, nullable=False)
     review_status = Column(String(50), default=ReviewStatus.NEW.value, nullable=False)
@@ -73,4 +74,3 @@ class ReviewDecision(Base, TimestampMixin):
 
     finding = relationship("Finding", back_populates="decisions")
     reviewer = relationship("User", back_populates="review_decisions")
-

@@ -1,0 +1,3 @@
+product_name,quantity,invoice_price,invoice_number,invoice_date,supplier_name,line_total,header_total
+Precision CNC Milling,50,120.00,INV-VP-101,2026-06-15,Vanguard Precision,6000.00,10500.00
+Surface Finishing Treatment,100,45.00,INV-VP-102,2026-06-15,Vanguard Precision,4500.00,10500.00

@@ -2,6 +2,8 @@ import io
 import pytest
 from backend.app.models.case import ReconciliationCase
 from backend.app.models.finding import Finding
+from backend.app.models.finding import FindingCategory
+from decimal import Decimal
 
 def test_oauth2_token_form_login(client, test_tenants):
     # Tests login with form data compatible with Swagger UI Authorize
@@ -135,4 +137,82 @@ def test_recent_documents_and_auto_reconcile(client, test_tenants, db_session):
     assert len(recent_docs) >= 1
     assert any(d["original_filename"] == "INV-DOC-123_Invoice.csv" for d in recent_docs)
 
+
+def test_dashboard_summary_uses_currency_breakdown_without_cross_currency_addition(client, test_tenants, db_session):
+    token = test_tenants["token1"]
+    user1 = test_tenants["user1"]
+    org1 = test_tenants["org1"]
+    ws1 = test_tenants["ws1"]
+
+    case = ReconciliationCase(
+        organization_id=org1.id,
+        workspace_id=ws1.id,
+        case_reference="CASE-CURR-001",
+        title="Currency Summary Test",
+        created_by_id=user1.id,
+        currency="REVIEW_REQUIRED",
+    )
+    db_session.add(case)
+    db_session.flush()
+
+    # Eligible overcharge in GBP
+    f1 = Finding(
+        organization_id=org1.id,
+        case_id=case.id,
+        finding_category=FindingCategory.CONTRACT_PRICE_MISMATCH.value,
+        supplier_name="Supplier A",
+        invoice_reference="INV-GBP-1",
+        expected_amount=Decimal("100.00"),
+        invoiced_amount=Decimal("120.00"),
+        potential_difference=Decimal("20.00"),
+        currency="GBP",
+        severity="LOW",
+        review_status="NEW",
+        calculation_explanation="GBP overcharge"
+    )
+
+    # Eligible overcharge in USD
+    f2 = Finding(
+        organization_id=org1.id,
+        case_id=case.id,
+        finding_category=FindingCategory.PO_PRICE_MISMATCH.value,
+        supplier_name="Supplier B",
+        invoice_reference="INV-USD-1",
+        expected_amount=Decimal("200.00"),
+        invoiced_amount=Decimal("250.00"),
+        potential_difference=Decimal("50.00"),
+        currency="USD",
+        severity="LOW",
+        review_status="NEW",
+        calculation_explanation="USD overcharge"
+    )
+
+    # Not eligible for gross overcharge KPI
+    f3 = Finding(
+        organization_id=org1.id,
+        case_id=case.id,
+        finding_category=FindingCategory.INCORRECT_LINE_TOTAL.value,
+        supplier_name="Supplier B",
+        invoice_reference="INV-USD-1",
+        expected_amount=Decimal("10.00"),
+        invoiced_amount=Decimal("12.00"),
+        potential_difference=Decimal("2.00"),
+        currency="USD",
+        severity="LOW",
+        review_status="NEW",
+        calculation_explanation="Arithmetic mismatch"
+    )
+
+    db_session.add_all([f1, f2, f3])
+    db_session.commit()
+
+    res = client.get("/v1/cases/summary/dashboard", headers={"Authorization": f"Bearer {token}"})
+    assert res.status_code == 200, res.text
+    data = res.json()
+
+    # Cross-currency totals must remain in breakdown only
+    assert float(data["potential_leakage"]) == 0.0
+    assert float(data["potential_leakage_by_currency"]["GBP"]) == 20.0
+    assert float(data["potential_leakage_by_currency"]["USD"]) == 50.0
+    assert data["currency_status"] == "MIXED"
 

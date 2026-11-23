@@ -1,7 +1,8 @@
 import React, { useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { apiClient } from '../api/client';
-import { Finding, ReconciliationCase } from '../types';
+import { Finding, ReconciliationCase, UploadedDocument } from '../types';
+import { renderMoney } from '../utils/currency';
 import {
   CheckSquare,
   CheckCircle2,
@@ -11,16 +12,23 @@ import {
   TrendingDown,
   Building2,
   Clock,
-  ShieldAlert
+  ShieldAlert,
+  FileText,
+  Filter
 } from 'lucide-react';
 
 export const HumanReview: React.FC = () => {
+  const [searchParams, setSearchParams] = useSearchParams();
   const [cases, setCases] = useState<ReconciliationCase[]>([]);
   const [selectedCaseId, setSelectedCaseId] = useState('');
+  const [documents, setDocuments] = useState<UploadedDocument[]>([]);
+  const [selectedDocId, setSelectedDocId] = useState<string>('ALL');
   const [findings, setFindings] = useState<Finding[]>([]);
   const [loading, setLoading] = useState(true);
   const [actioningId, setActioningId] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'PENDING' | 'HISTORY'>('PENDING');
+  const [redirectNotice, setRedirectNotice] = useState<string | null>(null);
+  const navigate = useNavigate();
 
   useEffect(() => {
     fetchInitial();
@@ -32,8 +40,36 @@ export const HumanReview: React.FC = () => {
       const res = await apiClient.get('/cases/');
       setCases(res.data);
       if (res.data.length > 0) {
-        setSelectedCaseId(res.data[0].id);
-        fetchFindings(res.data[0].id);
+        const queryCaseId = searchParams.get('caseId');
+        const cId = (queryCaseId && res.data.some((c: any) => c.id === queryCaseId)) ? queryCaseId : res.data[0].id;
+        setSelectedCaseId(cId);
+
+        // Fetch documents for the selected case
+        let docsList: UploadedDocument[] = [];
+        try {
+          const docsRes = await apiClient.get(`/cases/${cId}/documents`);
+          docsList = docsRes.data || [];
+          setDocuments(docsList);
+        } catch (e) {
+          console.error('Failed to load case documents:', e);
+        }
+
+        // Determine which document to filter to (prioritize URL query param, then sessionStorage, then latest uploaded)
+        const queryDocId = searchParams.get('documentId');
+        const storedDocId = sessionStorage.getItem('last_uploaded_document_id');
+        let initialDocId = 'ALL';
+
+        if (queryDocId && docsList.some((d) => d.id === queryDocId)) {
+          initialDocId = queryDocId;
+        } else if (storedDocId && docsList.some((d) => d.id === storedDocId)) {
+          initialDocId = storedDocId;
+        } else if (docsList.length > 0) {
+          // Default to the most recently uploaded file so only its awaiting decisions appear!
+          initialDocId = docsList[0].id;
+        }
+
+        setSelectedDocId(initialDocId);
+        await fetchFindings(cId, initialDocId);
       }
     } catch (err) {
       console.error(err);
@@ -42,10 +78,13 @@ export const HumanReview: React.FC = () => {
     }
   };
 
-  const fetchFindings = async (cId: string) => {
+  const fetchFindings = async (cId: string, docId: string = 'ALL') => {
     try {
       setLoading(true);
-      const res = await apiClient.get(`/cases/${cId}/findings`);
+      const endpoint = (docId && docId !== 'ALL')
+        ? `/cases/${cId}/findings?document_id=${docId}`
+        : `/cases/${cId}/findings`;
+      const res = await apiClient.get(endpoint);
       setFindings(res.data);
     } catch (err) {
       console.error(err);
@@ -54,10 +93,33 @@ export const HumanReview: React.FC = () => {
     }
   };
 
-  const handleCaseChange = (cId: string) => {
+  const handleCaseChange = async (cId: string) => {
     setSelectedCaseId(cId);
-    fetchFindings(cId);
+    let docsList: UploadedDocument[] = [];
+    try {
+      const docsRes = await apiClient.get(`/cases/${cId}/documents`);
+      docsList = docsRes.data || [];
+      setDocuments(docsList);
+    } catch (e) {
+      console.error(e);
+    }
+    const nextDocId = docsList.length > 0 ? docsList[0].id : 'ALL';
+    setSelectedDocId(nextDocId);
+    fetchFindings(cId, nextDocId);
   };
+
+  const handleDocumentChange = (docId: string) => {
+    setSelectedDocId(docId);
+    if (docId && docId !== 'ALL') {
+      sessionStorage.setItem('last_uploaded_document_id', docId);
+      setSearchParams({ caseId: selectedCaseId, documentId: docId });
+    } else {
+      setSearchParams(selectedCaseId ? { caseId: selectedCaseId } : {});
+    }
+    fetchFindings(selectedCaseId, docId);
+  };
+
+  const activeDoc = documents.find((d) => d.id === selectedDocId);
 
   const handleQuickDecision = async (findingId: string, action: 'CONFIRM' | 'REJECT' | 'REQUEST_INFO') => {
     setActioningId(findingId);
@@ -66,7 +128,18 @@ export const HumanReview: React.FC = () => {
         action,
         comment: `Quick review action: ${action}`
       });
-      fetchFindings(selectedCaseId);
+
+      const remaining = pendingFindings.filter((f) => f.id !== findingId);
+      if (remaining.length === 0) {
+        const fileLabel = activeDoc?.original_filename ? ` for ${activeDoc.original_filename}` : '';
+        setRedirectNotice(`All awaiting decisions completed${fileLabel}! Human review done — routing to Reports & Exports...`);
+        setTimeout(() => {
+          const docParam = selectedDocId && selectedDocId !== 'ALL' ? `&documentId=${selectedDocId}` : '';
+          navigate(selectedCaseId ? `/reports?caseId=${selectedCaseId}${docParam}` : '/reports');
+        }, 1100);
+      } else {
+        fetchFindings(selectedCaseId, selectedDocId);
+      }
     } catch (err) {
       console.error('Failed to update decision:', err);
     } finally {
@@ -87,18 +160,66 @@ export const HumanReview: React.FC = () => {
           </p>
         </div>
 
-        <select
-          value={selectedCaseId}
-          onChange={(e) => handleCaseChange(e.target.value)}
-          className="px-3 py-2 border border-slate-300 rounded-lg text-sm text-slate-900 bg-white focus:outline-none focus:ring-2 focus:ring-sky-500"
-        >
-          {cases.map((c) => (
-            <option key={c.id} value={c.id}>
-              {c.case_reference} - {c.title}
-            </option>
-          ))}
-        </select>
+        <div className="flex flex-wrap items-center gap-2.5">
+          {/* Case Selector */}
+          <select
+            value={selectedCaseId}
+            onChange={(e) => handleCaseChange(e.target.value)}
+            className="px-3 py-2 border border-slate-300 rounded-lg text-sm text-slate-900 bg-white focus:outline-none focus:ring-2 focus:ring-sky-500 shadow-sm"
+          >
+            {cases.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.case_reference} - {c.title}
+              </option>
+            ))}
+          </select>
+
+          {/* Document / Uploaded File Selector */}
+          <select
+            value={selectedDocId}
+            onChange={(e) => handleDocumentChange(e.target.value)}
+            className="px-3 py-2 border border-indigo-200 rounded-lg text-sm font-medium text-slate-900 bg-white focus:outline-none focus:ring-2 focus:ring-indigo-500 shadow-sm max-w-[280px] truncate"
+            title="Filter by uploaded file"
+          >
+            {documents.length > 0 && (
+              <optgroup label="Uploaded Documents">
+                {documents.map((d, idx) => (
+                  <option key={d.id} value={d.id}>
+                    {idx === 0 ? '⭐ (Latest) ' : '📄 '}{d.original_filename}
+                  </option>
+                ))}
+              </optgroup>
+            )}
+            <option value="ALL">📁 All Case Documents ({documents.length} files)</option>
+          </select>
+        </div>
       </div>
+
+      {/* Uploaded File Filter Focus Pill */}
+      {selectedDocId !== 'ALL' && activeDoc && (
+        <div className="p-3.5 rounded-xl bg-amber-50/90 border border-amber-200/80 text-amber-900 text-xs flex items-center justify-between shadow-sm animate-in fade-in">
+          <div className="flex items-center gap-2">
+            <FileText className="w-4 h-4 text-amber-600 flex-shrink-0" />
+            <span>
+              Showing awaiting decisions exclusively for uploaded file: <b className="font-bold text-amber-950">{activeDoc.original_filename}</b> ({pendingFindings.length} awaiting decision)
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={() => handleDocumentChange('ALL')}
+            className="text-amber-800 hover:text-amber-950 font-bold underline text-xs ml-3 whitespace-nowrap"
+          >
+            Show All Documents
+          </button>
+        </div>
+      )}
+
+      {redirectNotice && (
+        <div className="p-4 rounded-xl bg-emerald-50 border border-emerald-300 text-emerald-900 text-xs flex items-center gap-2.5 animate-in fade-in shadow-sm">
+          <CheckCircle2 className="w-5 h-5 text-emerald-600 animate-pulse flex-shrink-0" />
+          <span className="font-bold">{redirectNotice}</span>
+        </div>
+      )}
 
       {/* Review Queue Summary */}
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
@@ -106,6 +227,9 @@ export const HumanReview: React.FC = () => {
           <div>
             <div className="text-xs font-bold text-amber-800 uppercase tracking-wider">Awaiting Decision</div>
             <div className="text-2xl font-bold text-amber-900 mt-1">{pendingFindings.length}</div>
+            {activeDoc && selectedDocId !== 'ALL' && (
+              <div className="text-[11px] text-amber-700 font-medium truncate max-w-[200px]">for {activeDoc.original_filename}</div>
+            )}
           </div>
           <Clock className="w-6 h-6 text-amber-600" />
         </div>
@@ -133,22 +257,20 @@ export const HumanReview: React.FC = () => {
       <div className="flex items-center gap-2 border-b border-slate-200 pb-2">
         <button
           onClick={() => setActiveTab('PENDING')}
-          className={`px-4 py-2 rounded-lg text-xs font-bold transition-all flex items-center gap-2 ${
-            activeTab === 'PENDING'
-              ? 'bg-amber-600 text-white shadow-sm'
-              : 'bg-white text-slate-600 hover:bg-slate-100 border border-slate-200'
-          }`}
+          className={`px-4 py-2 rounded-lg text-xs font-bold transition-all flex items-center gap-2 ${activeTab === 'PENDING'
+            ? 'bg-amber-600 text-white shadow-sm'
+            : 'bg-white text-slate-600 hover:bg-slate-100 border border-slate-200'
+            }`}
         >
           <Clock className="w-4 h-4" />
           Awaiting Decision ({pendingFindings.length})
         </button>
         <button
           onClick={() => setActiveTab('HISTORY')}
-          className={`px-4 py-2 rounded-lg text-xs font-bold transition-all flex items-center gap-2 ${
-            activeTab === 'HISTORY'
-              ? 'bg-slate-900 text-white shadow-sm'
-              : 'bg-white text-slate-600 hover:bg-slate-100 border border-slate-200'
-          }`}
+          className={`px-4 py-2 rounded-lg text-xs font-bold transition-all flex items-center gap-2 ${activeTab === 'HISTORY'
+            ? 'bg-slate-900 text-white shadow-sm'
+            : 'bg-white text-slate-600 hover:bg-slate-100 border border-slate-200'
+            }`}
         >
           <CheckCircle2 className="w-4 h-4" />
           Reviewed History & Archive ({reviewedFindings.length})
@@ -175,18 +297,26 @@ export const HumanReview: React.FC = () => {
             <div className="p-8 text-center text-slate-400 text-xs">Loading review queue...</div>
           ) : activeTab === 'PENDING' ? (
             pendingFindings.length === 0 ? (
-              <div className="p-10 text-center text-slate-500 text-xs space-y-2">
-                <CheckCircle2 className="w-8 h-8 text-emerald-500 mx-auto opacity-80" />
-                <p className="font-bold text-slate-700">All findings have been reviewed for this case!</p>
-                <p className="text-[11px] text-slate-400">
-                  Reviewed findings have been archived. You can inspect them anytime in the History tab.
+              <div className="p-10 text-center text-slate-500 text-xs space-y-3">
+                <CheckCircle2 className="w-10 h-10 text-emerald-500 mx-auto opacity-80" />
+                <p className="font-bold text-sm text-slate-800">All findings have been reviewed for this case!</p>
+                <p className="text-[11px] text-slate-500 max-w-md mx-auto">
+                  Every exception has been evaluated and confirmed or rejected. You can proceed directly to audit reports and dossier exports.
                 </p>
-                <button
-                  onClick={() => setActiveTab('HISTORY')}
-                  className="mt-2 inline-flex items-center gap-1 text-xs font-semibold text-sky-600 hover:text-sky-700"
-                >
-                  View Reviewed History ({reviewedFindings.length}) <ArrowRight className="w-3.5 h-3.5" />
-                </button>
+                <div className="pt-2 flex items-center justify-center gap-3">
+                  <button
+                    onClick={() => setActiveTab('HISTORY')}
+                    className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 text-xs font-semibold shadow-sm transition-all"
+                  >
+                    View Decision History ({reviewedFindings.length})
+                  </button>
+                  <Link
+                    to={selectedCaseId ? `/reports?caseId=${selectedCaseId}${selectedDocId && selectedDocId !== 'ALL' ? `&documentId=${selectedDocId}` : ''}` : '/reports'}
+                    className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold shadow transition-all"
+                  >
+                    Go to Reports & Exports <ArrowRight className="w-3.5 h-3.5" />
+                  </Link>
+                </div>
               </div>
             ) : (
               pendingFindings.map((f) => (
@@ -195,11 +325,10 @@ export const HumanReview: React.FC = () => {
                     <div className="flex items-center gap-2">
                       <span className="font-bold text-sm text-slate-900">{f.invoice_reference}</span>
                       <span className="text-xs text-slate-500 font-medium">({f.supplier_name})</span>
-                      <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider ${
-                        f.severity === 'CRITICAL' ? 'bg-rose-100 text-rose-800' :
+                      <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider ${f.severity === 'CRITICAL' ? 'bg-rose-100 text-rose-800' :
                         f.severity === 'HIGH' ? 'bg-orange-100 text-orange-800' :
-                        'bg-amber-100 text-amber-800'
-                      }`}>
+                          'bg-amber-100 text-amber-800'
+                        }`}>
                         {f.severity}
                       </span>
                       <span className="bg-slate-100 text-slate-600 px-2 py-0.5 rounded text-[11px] font-semibold">
@@ -212,9 +341,11 @@ export const HumanReview: React.FC = () => {
                     </p>
 
                     <div className="text-[11px] text-slate-500 flex items-center gap-4 pt-1">
-                      <span>Expected: <b className="text-slate-700">{f.currency === 'INR' ? '₹' : '£'}{Number(f.expected_amount).toFixed(2)}</b></span>
-                      <span>Invoiced: <b className="text-slate-700">{f.currency === 'INR' ? '₹' : '£'}{Number(f.invoiced_amount).toFixed(2)}</b></span>
-                      <span>Variance: <b className="text-rose-600">+{f.currency === 'INR' ? '₹' : '£'}{Number(f.potential_difference).toFixed(2)}</b></span>
+                      <span>Expected: <b className="text-slate-700">{renderMoney(Number(f.expected_amount), f.currency)}</b></span>
+                      <span>Invoiced: <b className="text-slate-700">{renderMoney(Number(f.invoiced_amount), f.currency)}</b></span>
+                      <span>Variance: <b className={Number(f.potential_difference) >= 0 ? "text-rose-600 font-bold" : "text-sky-600 font-bold"}>
+                        {Number(f.potential_difference) >= 0 ? '+' : ''}{renderMoney(Number(f.potential_difference), f.currency)}
+                      </b></span>
                     </div>
                   </div>
 
@@ -272,14 +403,13 @@ export const HumanReview: React.FC = () => {
                       <div className="flex items-center gap-2">
                         <span className="font-bold text-sm text-slate-900">{f.invoice_reference}</span>
                         <span className="text-xs text-slate-500 font-medium">({f.supplier_name})</span>
-                        
-                        <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider ${
-                          f.review_status === 'CONFIRMED'
-                            ? 'bg-emerald-100 text-emerald-800 border border-emerald-300'
-                            : f.review_status === 'REJECTED'
+
+                        <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider ${f.review_status === 'CONFIRMED'
+                          ? 'bg-emerald-100 text-emerald-800 border border-emerald-300'
+                          : f.review_status === 'REJECTED'
                             ? 'bg-slate-200 text-slate-800 border border-slate-300'
                             : 'bg-purple-100 text-purple-800 border border-purple-300'
-                        }`}>
+                          }`}>
                           {f.review_status === 'CONFIRMED' && '✓ Confirmed Exception'}
                           {f.review_status === 'REJECTED' && '✕ Rejected Finding'}
                           {f.review_status === 'NEEDS_MORE_INFO' && '? More Info Requested'}
@@ -295,9 +425,11 @@ export const HumanReview: React.FC = () => {
                       </p>
 
                       <div className="text-[11px] text-slate-500 flex flex-wrap items-center gap-4 pt-1">
-                        <span>Expected: <b className="text-slate-700">{f.currency === 'INR' ? '₹' : '£'}{Number(f.expected_amount).toFixed(2)}</b></span>
-                        <span>Invoiced: <b className="text-slate-700">{f.currency === 'INR' ? '₹' : '£'}{Number(f.invoiced_amount).toFixed(2)}</b></span>
-                        <span>Variance: <b className="text-slate-800">+{f.currency === 'INR' ? '₹' : '£'}{Number(f.potential_difference).toFixed(2)}</b></span>
+                        <span>Expected: <b className="text-slate-700">{renderMoney(Number(f.expected_amount), f.currency)}</b></span>
+                        <span>Invoiced: <b className="text-slate-700">{renderMoney(Number(f.invoiced_amount), f.currency)}</b></span>
+                        <span>Variance: <b className="text-slate-800">
+                          {Number(f.potential_difference) >= 0 ? '+' : ''}{renderMoney(Number(f.potential_difference), f.currency)}
+                        </b></span>
                         {latestDecision && (
                           <span className="text-slate-400">
                             Reviewed by: <b className="text-slate-600">{latestDecision.reviewer_name}</b> on{' '}
@@ -356,4 +488,3 @@ export const HumanReview: React.FC = () => {
     </div>
   );
 };
-

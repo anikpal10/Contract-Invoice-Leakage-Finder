@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { useSearchParams, Link } from 'react-router-dom';
 import { apiClient } from '../api/client';
 import { ReconciliationCase, Finding } from '../types';
+import { aggregateByCurrency, formatBreakdown, renderMoney } from '../utils/currency';
 import {
   Sparkles,
   TrendingDown,
@@ -56,20 +57,28 @@ export const ReconciliationResults: React.FC = () => {
     }
   };
 
-  const totalPotential = findings.reduce((acc, f) => acc + Number(f.potential_difference), 0);
-  const confirmedTotal = findings
-    .filter((f) => f.review_status === 'CONFIRMED')
-    .reduce((acc, f) => acc + Number(f.potential_difference), 0);
+  const totalPotentialByCurrency = aggregateByCurrency(
+    findings.map((f) => ({ currency: f.currency, amount: Number(f.potential_difference) }))
+  );
+  const confirmedPotentialByCurrency = aggregateByCurrency(
+    findings
+      .filter((f) => f.review_status === 'CONFIRMED')
+      .map((f) => ({ currency: f.currency, amount: Number(f.potential_difference) }))
+  );
 
   // Category breakdown
-  const categorySummary = findings.reduce((acc: Record<string, { count: number; total: number }>, f) => {
-    if (!acc[f.finding_category]) {
-      acc[f.finding_category] = { count: 0, total: 0 };
-    }
-    acc[f.finding_category].count += 1;
-    acc[f.finding_category].total += Number(f.potential_difference);
-    return acc;
-  }, {});
+  const categorySummary = findings.reduce(
+    (acc: Record<string, { count: number; byCurrency: Record<string, number> }>, f) => {
+      if (!acc[f.finding_category]) {
+        acc[f.finding_category] = { count: 0, byCurrency: {} };
+      }
+      acc[f.finding_category].count += 1;
+      const c = (f.currency || '').toUpperCase();
+      acc[f.finding_category].byCurrency[c] = (acc[f.finding_category].byCurrency[c] || 0) + Number(f.potential_difference);
+      return acc;
+    },
+    {}
+  );
 
   return (
     <div className="space-y-6">
@@ -125,9 +134,9 @@ export const ReconciliationResults: React.FC = () => {
             <TrendingDown className="w-4 h-4 text-rose-600" />
           </div>
           <div className="mt-2 text-2xl font-bold text-rose-700">
-            £{totalPotential.toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            {formatBreakdown(totalPotentialByCurrency)}
           </div>
-          <div className="text-[11px] text-slate-500 mt-1">Total identified differences awaiting review</div>
+          <div className="text-[11px] text-slate-500 mt-1">Gross potential overcharge across currencies</div>
         </div>
 
         <div className="bg-white p-5 rounded-xl border border-emerald-200 shadow-sm">
@@ -136,7 +145,7 @@ export const ReconciliationResults: React.FC = () => {
             <CheckCircle2 className="w-4 h-4 text-emerald-600" />
           </div>
           <div className="mt-2 text-2xl font-bold text-emerald-700">
-            £{confirmedTotal.toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            {formatBreakdown(confirmedPotentialByCurrency)}
           </div>
           <div className="text-[11px] text-slate-500 mt-1">Confirmed by authorized reviewer</div>
         </div>
@@ -157,7 +166,7 @@ export const ReconciliationResults: React.FC = () => {
           <div key={cat} className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
             <div className="text-xs font-bold text-slate-700 truncate">{cat.replace(/_/g, ' ')}</div>
             <div className="mt-2 flex items-baseline justify-between">
-              <span className="text-lg font-bold text-slate-900">£{data.total.toFixed(2)}</span>
+              <span className="text-lg font-bold text-slate-900">{formatBreakdown(data.byCurrency)}</span>
               <span className="text-xs text-slate-500 font-medium">{data.count} items</span>
             </div>
           </div>
@@ -207,28 +216,26 @@ export const ReconciliationResults: React.FC = () => {
                       </span>
                     </td>
                     <td className="py-3 px-4 text-slate-600 truncate max-w-[150px]">{f.supplier_name}</td>
-                    <td className="py-3 px-4 text-right font-mono">£{Number(f.expected_amount).toFixed(2)}</td>
-                    <td className="py-3 px-4 text-right font-mono">£{Number(f.invoiced_amount).toFixed(2)}</td>
+                    <td className="py-3 px-4 text-right font-mono">{renderMoney(Number(f.expected_amount), f.currency)}</td>
+                    <td className="py-3 px-4 text-right font-mono">{renderMoney(Number(f.invoiced_amount), f.currency)}</td>
                     <td className="py-3 px-4 text-right font-mono font-bold text-rose-600">
-                      +£{Number(f.potential_difference).toFixed(2)}
+                      +{renderMoney(Number(f.potential_difference), f.currency)}
                     </td>
                     <td className="py-3 px-4">
-                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider ${
-                        f.severity === 'CRITICAL' ? 'bg-rose-100 text-rose-800' :
-                        f.severity === 'HIGH' ? 'bg-orange-100 text-orange-800' :
-                        f.severity === 'MEDIUM' ? 'bg-amber-100 text-amber-800' :
-                        'bg-slate-100 text-slate-700'
-                      }`}>
+                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider ${f.severity === 'CRITICAL' ? 'bg-rose-100 text-rose-800' :
+                          f.severity === 'HIGH' ? 'bg-orange-100 text-orange-800' :
+                            f.severity === 'MEDIUM' ? 'bg-amber-100 text-amber-800' :
+                              'bg-slate-100 text-slate-700'
+                        }`}>
                         {f.severity}
                       </span>
                     </td>
                     <td className="py-3 px-4">
-                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider ${
-                        f.review_status === 'CONFIRMED' ? 'bg-emerald-100 text-emerald-800' :
-                        f.review_status === 'REJECTED' ? 'bg-slate-200 text-slate-700' :
-                        f.review_status === 'NEEDS_MORE_INFO' ? 'bg-purple-100 text-purple-800' :
-                        'bg-sky-100 text-sky-800'
-                      }`}>
+                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider ${f.review_status === 'CONFIRMED' ? 'bg-emerald-100 text-emerald-800' :
+                          f.review_status === 'REJECTED' ? 'bg-slate-200 text-slate-700' :
+                            f.review_status === 'NEEDS_MORE_INFO' ? 'bg-purple-100 text-purple-800' :
+                              'bg-sky-100 text-sky-800'
+                        }`}>
                         {f.review_status.replace(/_/g, ' ')}
                       </span>
                     </td>
@@ -250,4 +257,3 @@ export const ReconciliationResults: React.FC = () => {
     </div>
   );
 };
-

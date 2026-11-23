@@ -9,9 +9,15 @@ from backend.app.core.database import get_db
 from backend.app.core.dependencies import get_current_user, require_role, verify_case_tenant
 from backend.app.models.user import User, UserRole
 from backend.app.models.case import ReconciliationCase, CaseStatus
-from backend.app.models.finding import Finding
+from backend.app.models.finding import Finding, ReviewStatus
 from backend.app.models.document import UploadedDocument, DocumentCategory, ProcessingStatus
-from backend.app.models.extracted_entities import ExtractedDocumentField
+from backend.app.models.extracted_entities import (
+    ExtractedDocumentField,
+    Invoice,
+    Contract,
+    InvoiceLineItem,
+    ContractLineItem,
+)
 from backend.app.schemas.document import (
     DocumentResponse, DocumentUploadResponse,
     DirectPathIngestRequest, DirectFolderIngestRequest,
@@ -25,8 +31,28 @@ from backend.app.services.extraction import extraction_service
 from backend.app.services.reconciliation_engine import reconciliation_engine
 from backend.app.services.audit import log_audit_event
 from backend.app.core.config import settings
+from backend.app.services.financial_summary import (
+    aggregate_amounts_by_currency,
+    net_variance_by_currency,
+    single_currency_total,
+    currency_status,
+    is_eligible_overcharge,
+    is_eligible_undercharge,
+    get_currency_symbol,
+)
 
 router = APIRouter(prefix="/cases", tags=["Document Upload & Processing"])
+
+
+def _format_exposure_text(by_currency: dict) -> str:
+    if not by_currency:
+        return "0.00"
+    single_total = single_currency_total(by_currency)
+    if single_total is not None:
+        c = next(iter(by_currency.keys()))
+        return f"{get_currency_symbol(c)}{single_total:,.2f}"
+    parts = [f"{k} {v:,.2f}" for k, v in sorted(by_currency.items())]
+    return " / ".join(parts)
 
 @router.get("/documents/recent", response_model=List[RecentDocumentItem])
 def get_recent_documents(
@@ -76,12 +102,64 @@ def _assemble_pipeline_result(
     case_ref = case.case_reference if case else "N/A"
     case_title = case.title if case else "Reconciliation Case"
 
-    findings = db.query(Finding).filter(Finding.case_id == doc.case_id).order_by(Finding.potential_difference.desc()).all()
+    # Requirement 7: Never show a final financial summary when required source data is missing or unvalidated
+    if doc.processing_status != ProcessingStatus.EXTRACTED.value:
+        return DocumentUploadResponse(
+            id=doc.id,
+            case_id=doc.case_id,
+            case_reference=case_ref,
+            case_title=case_title,
+            original_filename=doc.original_filename,
+            category=doc.category,
+            processing_status=doc.processing_status,
+            message=message or f"Document '{doc.original_filename}' is {doc.processing_status}. Financial summary is unavailable until extraction is completed.",
+            reconciled=False,
+            findings_count=0,
+            potential_leakage=Decimal("0.00"),
+            potential_leakage_by_currency={},
+            currency_status="UNVALIDATED",
+            recognized_data=metadata,
+            findings=[],
+            automated_steps=[
+                AutomatedStepItem(
+                    name="1. Ingestion & Validation",
+                    status=doc.processing_status,
+                    detail=doc.error_message or f"Extraction status: {doc.processing_status}. Source document verification required."
+                )
+            ]
+        )
+
+    # Requirement 4: Calculate billed amounts from validated extracted line items if total/subtotal is missing or zero
+    line_items_list = metadata.get("line_items", [])
+    if line_items_list:
+        calc_line_sum = sum(float(li.get("line_total", 0)) for li in line_items_list)
+        if not metadata.get("total_amount") or float(metadata.get("total_amount", 0)) <= 0:
+            metadata["total_amount"] = calc_line_sum
+        if not metadata.get("subtotal") or float(metadata.get("subtotal", 0)) <= 0:
+            metadata["subtotal"] = calc_line_sum
+
+    all_case_findings = db.query(Finding).filter(Finding.case_id == doc.case_id).order_by(Finding.potential_difference.desc()).all()
     inv_num = metadata.get("invoice_number")
+    contract_ref = metadata.get("contract_reference")
+    po_num = metadata.get("po_number")
+
+    # Scope findings strictly to this document to prevent leaking unrelated exceptions
     if inv_num:
-        doc_findings = [f for f in findings if f.invoice_reference == inv_num]
-        if doc_findings:
-            findings = doc_findings
+        findings = [f for f in all_case_findings if f.invoice_reference == inv_num]
+    elif contract_ref:
+        findings = [
+            f for f in all_case_findings
+            if any(isinstance(r, dict) and (r.get("contract_reference") == contract_ref or r.get("document_id") == doc.id)
+                   for r in (f.source_document_references or []))
+        ]
+    elif po_num:
+        findings = [
+            f for f in all_case_findings
+            if any(isinstance(r, dict) and (r.get("po_number") == po_num or r.get("document_id") == doc.id)
+                   for r in (f.source_document_references or []))
+        ]
+    else:
+        findings = []
 
     finding_items = [
         PipelineResultFinding(
@@ -105,7 +183,41 @@ def _assemble_pipeline_result(
     ]
 
     findings_count = len(findings)
-    potential_leakage = sum((f.potential_difference for f in findings), Decimal("0.00"))
+
+    # Gross overcharges
+    gross_overcharges_by_currency = aggregate_amounts_by_currency(
+        findings,
+        "potential_difference",
+        predicate=is_eligible_overcharge,
+    )
+    gross_overcharges = single_currency_total(gross_overcharges_by_currency) or Decimal("0.00")
+
+    # Potential undercharges (positive magnitude of negative price variances)
+    raw_undercharges_by_currency = aggregate_amounts_by_currency(
+        findings,
+        "potential_difference",
+        predicate=is_eligible_undercharge,
+    )
+    potential_undercharges_by_currency = {
+        c: abs(v) for c, v in raw_undercharges_by_currency.items()
+    }
+    potential_undercharges = single_currency_total(potential_undercharges_by_currency) or Decimal("0.00")
+
+    # Net variance = gross overcharges - potential undercharges
+    net_variance_by_currency_map = net_variance_by_currency(
+        gross_overcharges_by_currency,
+        potential_undercharges_by_currency,
+    )
+    net_variance = single_currency_total(net_variance_by_currency_map) or (gross_overcharges - potential_undercharges)
+
+    potential_leakage_by_currency = gross_overcharges_by_currency
+    potential_leakage = gross_overcharges
+    leakage_status = currency_status(
+        gross_overcharges_by_currency or potential_undercharges_by_currency
+    )
+    exposure_text = _format_exposure_text(gross_overcharges_by_currency)
+    undercharge_text = _format_exposure_text(potential_undercharges_by_currency)
+    net_variance_text = _format_exposure_text(net_variance_by_currency_map)
     line_count = len(metadata.get("line_items", []))
     supplier_display = case.supplier.name if (case and case.supplier) else "supplier"
 
@@ -138,11 +250,15 @@ def _assemble_pipeline_result(
         AutomatedStepItem(
             name="6. Exception Identification & Leakage Computation",
             status="COMPLETED",
-            detail=f"Generated {findings_count} finding(s) totaling £{potential_leakage:,.2f} variance exposure."
+            detail=f"Generated {findings_count} finding(s) totaling {exposure_text} gross overcharges, -{undercharge_text} gross undercharges (Net Variance: {net_variance_text}, {leakage_status})."
         )
     ]
 
-    leakage_msg = f"Auto-reconciled: {findings_count} finding(s) identified (£{potential_leakage:,.2f} variance exposure)." if findings_count > 0 else "Auto-reconciled (clean match, 0 exceptions)."
+    leakage_msg = (
+        f"Auto-reconciled: {findings_count} finding(s) identified (Gross Overcharge: {exposure_text}, Gross Undercharge: -{undercharge_text}, Net Variance: {net_variance_text})."
+        if findings_count > 0
+        else "Auto-reconciled (clean match, 0 exceptions)."
+    )
 
     return DocumentUploadResponse(
         id=doc.id,
@@ -155,7 +271,15 @@ def _assemble_pipeline_result(
         message=message or f"Document '{doc.original_filename}' recognized and reconciled successfully. {leakage_msg}",
         reconciled=True,
         findings_count=findings_count,
-        potential_leakage=potential_leakage,
+        potential_leakage=gross_overcharges,
+        potential_leakage_by_currency=gross_overcharges_by_currency,
+        gross_overcharges=gross_overcharges,
+        gross_overcharges_by_currency=gross_overcharges_by_currency,
+        potential_undercharges=potential_undercharges,
+        potential_undercharges_by_currency=potential_undercharges_by_currency,
+        net_variance=net_variance,
+        net_variance_by_currency=net_variance_by_currency_map,
+        currency_status=leakage_status,
         recognized_data=metadata,
         findings=finding_items,
         automated_steps=automated_steps
@@ -180,7 +304,15 @@ def get_latest_pipeline_result(
     elif case_id:
         query = query.filter(UploadedDocument.case_id == case_id)
 
-    doc = query.order_by(UploadedDocument.created_at.desc()).first()
+    # Exclude generated export dossiers and prioritize successfully extracted evidence documents
+    doc = query.filter(
+        ~UploadedDocument.original_filename.like("Reconciliation_%.pdf"),
+        ~UploadedDocument.original_filename.like("Export_%.pdf")
+    ).order_by(
+        (UploadedDocument.processing_status == ProcessingStatus.EXTRACTED.value).desc(),
+        UploadedDocument.created_at.desc()
+    ).first()
+
     if not doc:
         raise HTTPException(status_code=404, detail="No processed documents found")
 
@@ -200,6 +332,14 @@ def get_latest_pipeline_result(
         recognized_data=pipeline_res.recognized_data,
         findings_count=pipeline_res.findings_count,
         potential_leakage=pipeline_res.potential_leakage,
+        potential_leakage_by_currency=pipeline_res.potential_leakage_by_currency,
+        gross_overcharges=pipeline_res.gross_overcharges,
+        gross_overcharges_by_currency=pipeline_res.gross_overcharges_by_currency,
+        potential_undercharges=pipeline_res.potential_undercharges,
+        potential_undercharges_by_currency=pipeline_res.potential_undercharges_by_currency,
+        net_variance=pipeline_res.net_variance,
+        net_variance_by_currency=pipeline_res.net_variance_by_currency,
+        currency_status=pipeline_res.currency_status,
         findings=pipeline_res.findings,
         automated_steps=pipeline_res.automated_steps
     )
@@ -302,16 +442,24 @@ def batch_upload_documents(
     current_user: User = Depends(require_role([UserRole.ADMIN, UserRole.MANAGER, UserRole.REVIEWER]))
 ):
     case = verify_case_tenant(case_id, current_user, db)
-    uploaded = []
+    uploaded: List[dict] = []
     skipped = 0
     errors = 0
+    error_details: List[str] = []
+
+    if not files:
+        raise HTTPException(status_code=400, detail="No files were provided for upload.")
 
     for file in files:
         try:
-            # 1. Determine category
-            cat = category.upper() if category and category.upper() in [c.value for c in DocumentCategory] else infer_category(file.filename, "")
-            
-            # 2. Save file
+            # 1. Determine category (AUTO -> infer from filename)
+            cat = (
+                category.upper()
+                if category and category.upper() in [c.value for c in DocumentCategory]
+                else infer_category(file.filename or "", "")
+            )
+
+            # 2. Save file (validates extension + size, computes SHA-256)
             saved_filename, storage_path, file_size, sha256_hash = storage_service.save_upload(case_id, file)
 
             # 3. Duplicate check - if already uploaded in this case, refresh extraction and include in results
@@ -328,10 +476,16 @@ def batch_upload_documents(
                     extraction_service.extract_document(db, existing)
                 except Exception as e:
                     print(f"Extraction refresh error: {e}")
-                uploaded.append({"id": existing.id, "filename": existing.original_filename, "category": existing.category, "reprocessed": True})
+                skipped += 1
+                uploaded.append({
+                    "id": existing.id,
+                    "filename": existing.original_filename,
+                    "category": existing.category,
+                    "reprocessed": True,
+                })
                 continue
 
-            ext = file.filename.split(".")[-1].lower() if "." in file.filename else "unknown"
+            ext = file.filename.split(".")[-1].lower() if file.filename and "." in file.filename else "unknown"
             doc = UploadedDocument(
                 case_id=case.id,
                 organization_id=current_user.organization_id,
@@ -356,17 +510,36 @@ def batch_upload_documents(
             uploaded.append({"id": doc.id, "filename": doc.original_filename, "category": doc.category})
         except Exception as ex:
             errors += 1
+            error_details.append(f"{getattr(file, 'filename', 'unknown')}: {ex}")
             print(f"Batch upload error: {ex}")
+
+    # If nothing could be ingested at all, surface a clear error instead of a fake success
+    if not uploaded:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No files could be ingested. "
+                + ("; ".join(error_details) if error_details else "Please check file types and sizes.")
+            ),
+        )
 
     # Automatically execute multi-way reconciliation once files are ingested
     findings_count = 0
     potential_leakage = Decimal("0.00")
+    potential_leakage_by_currency: dict = {}
+    leakage_status = "NONE"
     findings = []
     has_reprocessed = any(u.get("reprocessed") for u in uploaded)
     try:
         findings = reconciliation_engine.run_reconciliation(db=db, case=case, reset_reviewed=has_reprocessed)
         findings_count = len(findings)
-        potential_leakage = sum((f.potential_difference for f in findings), Decimal("0.00"))
+        potential_leakage_by_currency = aggregate_amounts_by_currency(
+            findings,
+            "potential_difference",
+            predicate=is_eligible_overcharge,
+        )
+        potential_leakage = single_currency_total(potential_leakage_by_currency) or Decimal("0.00")
+        leakage_status = currency_status(potential_leakage_by_currency)
     except Exception as re_err:
         print(f"Auto-reconciliation error on batch upload: {re_err}")
 
@@ -380,9 +553,28 @@ def batch_upload_documents(
         payload_after={"uploaded_count": len(uploaded), "skipped": skipped, "errors": errors, "findings_count": findings_count}
     )
 
-    reconcile_note = f" Reconciled: {findings_count} finding(s) detected (£{potential_leakage:,.2f} variance)." if findings_count > 0 else " Reconciled (clean match)."
+    exposure_text = _format_exposure_text(potential_leakage_by_currency)
+    reconcile_note = (
+        f" Reconciled: {findings_count} finding(s) detected ({exposure_text} gross variance exposure, {leakage_status})."
+        if findings_count > 0
+        else " Reconciled (clean match)."
+    )
 
-    last_doc = db.query(UploadedDocument).filter(UploadedDocument.id == uploaded[-1]["id"]).first() if uploaded else None
+    # Prefer the most recently extracted document for the pipeline preview payload
+    last_doc = None
+    for item in reversed(uploaded):
+        candidate = db.query(UploadedDocument).filter(UploadedDocument.id == item["id"]).first()
+        if candidate and candidate.processing_status == ProcessingStatus.EXTRACTED.value:
+            last_doc = candidate
+            break
+    if last_doc is None:
+        last_doc = db.query(UploadedDocument).filter(UploadedDocument.id == uploaded[-1]["id"]).first()
+
+    # Build a pipeline-shaped payload so the frontend AutomatedRecognitionPipelineView renders correctly
+    pipeline_payload = _assemble_pipeline_result(
+        last_doc, case, db,
+        message=f"Successfully processed {len(uploaded)} file(s). {skipped} duplicate(s) skipped.{reconcile_note}"
+    ) if last_doc else None
 
     return {
         "message": f"Successfully processed {len(uploaded)} file(s). {skipped} duplicate(s) skipped.{reconcile_note}",
@@ -394,11 +586,21 @@ def batch_upload_documents(
         "case_id": case.id,
         "case_reference": case.case_reference,
         "case_title": case.title,
-        "original_filename": uploaded[-1]["filename"] if uploaded else "Batch",
-        "category": uploaded[-1]["category"] if uploaded else "INVOICE",
+        "document_id": last_doc.id if last_doc else None,
+        "original_filename": last_doc.original_filename if last_doc else "Batch",
+        "category": last_doc.category if last_doc else "INVOICE",
+        "processing_status": last_doc.processing_status if last_doc else "PENDING",
         "recognized_data": last_doc.extracted_metadata if last_doc else None,
         "findings_count": findings_count,
         "potential_leakage": float(potential_leakage),
+        "potential_leakage_by_currency": {k: float(v) for k, v in potential_leakage_by_currency.items()},
+        "gross_overcharges": float(pipeline_payload.gross_overcharges) if pipeline_payload else float(potential_leakage),
+        "gross_overcharges_by_currency": {k: float(v) for k, v in (pipeline_payload.gross_overcharges_by_currency or {}).items()} if pipeline_payload else {},
+        "potential_undercharges": float(pipeline_payload.potential_undercharges) if pipeline_payload else 0.0,
+        "potential_undercharges_by_currency": {k: float(v) for k, v in (pipeline_payload.potential_undercharges_by_currency or {}).items()} if pipeline_payload else {},
+        "net_variance": float(pipeline_payload.net_variance) if pipeline_payload else float(potential_leakage),
+        "net_variance_by_currency": {k: float(v) for k, v in (pipeline_payload.net_variance_by_currency or {}).items()} if pipeline_payload else {},
+        "currency_status": leakage_status,
         "findings": [
             PipelineResultFinding(
                 id=f.id,
@@ -433,7 +635,7 @@ def batch_upload_documents(
             {
                 "name": "3. Master Agreement & Rate Card Correlation",
                 "status": "COMPLETED",
-                "detail": f"Correlated with master rate cards and agreements."
+                "detail": "Correlated with master rate cards and agreements."
             },
             {
                 "name": "4. Purchase Order & Delivery Note Verification",
@@ -448,9 +650,10 @@ def batch_upload_documents(
             {
                 "name": "6. Exception Identification & Leakage Computation",
                 "status": "COMPLETED",
-                "detail": f"Generated {findings_count} finding(s) totaling £{potential_leakage:,.2f} variance exposure."
+                "detail": f"Generated {findings_count} finding(s) totaling {exposure_text} gross variance exposure ({leakage_status})."
             }
-        ]
+        ],
+        "pipeline": pipeline_payload.model_dump() if pipeline_payload else None,
     }
 
 def infer_category(filename: str, path_str: str) -> str:
@@ -972,4 +1175,3 @@ def clear_all_documents(
     )
 
     return {"message": f"Cleared {count} document(s) from case.", "cleared_count": count}
-

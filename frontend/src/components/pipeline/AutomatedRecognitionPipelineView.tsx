@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { PipelineResultFinding, AutomatedStepItem } from '../../types';
+import { getCurrencySymbol, renderMoney } from '../../utils/currency';
 import {
   FileText,
   CheckCircle2,
@@ -31,6 +32,12 @@ interface Props {
     findings?: PipelineResultFinding[];
     findings_count?: number;
     potential_leakage?: number;
+    gross_overcharges?: number;
+    potential_undercharges?: number;
+    net_variance?: number;
+    gross_overcharges_by_currency?: Record<string, number>;
+    potential_undercharges_by_currency?: Record<string, number>;
+    net_variance_by_currency?: Record<string, number>;
     automated_steps?: AutomatedStepItem[];
   };
   onClose?: () => void;
@@ -46,6 +53,44 @@ export const AutomatedRecognitionPipelineView: React.FC<Props> = ({ pipelineData
   const steps: AutomatedStepItem[] = pipelineData.automated_steps || [];
   const findingsCount = pipelineData.findings_count ?? findings.length;
   const potentialLeakage = Number(pipelineData.potential_leakage ?? 0);
+  const detectedCurrency = (recognized.currency || findings[0]?.currency || 'REVIEW_REQUIRED').toUpperCase();
+  const currencySymbol = getCurrencySymbol(detectedCurrency);
+
+  // Requirement 1: Total Billed must source from validated invoice total, not contract amount
+  const totalBilled = Number(recognized.total_billed ?? recognized.total_amount ?? 0);
+  const contractTotal = recognized.contract_total != null ? Number(recognized.contract_total) : null;
+
+  // Requirement 3: Separate metrics for gross overcharges, undercharges, and net variance
+  let computedOvercharges = 0;
+  let computedUndercharges = 0;
+
+  findings.forEach((f) => {
+    const diff = Number(f.potential_difference || 0);
+    if (f.finding_category === 'POTENTIAL_UNDERCHARGE' || diff < 0) {
+      computedUndercharges += Math.abs(diff);
+    } else if (diff > 0) {
+      computedOvercharges += diff;
+    }
+  });
+
+  const grossOvercharges = Number(
+    (pipelineData.gross_overcharges !== undefined && pipelineData.gross_overcharges !== null && Number(pipelineData.gross_overcharges) > 0)
+      ? pipelineData.gross_overcharges
+      : computedOvercharges > 0
+        ? computedOvercharges
+        : potentialLeakage
+  );
+
+  const potentialUndercharges = Number(
+    (pipelineData.potential_undercharges !== undefined && pipelineData.potential_undercharges !== null && Number(pipelineData.potential_undercharges) > 0)
+      ? pipelineData.potential_undercharges
+      : computedUndercharges
+  );
+
+  // Net Variance = Gross Overcharges - Gross Undercharges
+  const netVariance = (pipelineData.net_variance !== undefined && pipelineData.net_variance !== null && potentialUndercharges === 0)
+    ? Number(pipelineData.net_variance)
+    : (grossOvercharges - potentialUndercharges);
 
   const toggleFinding = (id: string) => {
     setExpandedFindingId((prev) => (prev === id ? null : id));
@@ -78,27 +123,67 @@ export const AutomatedRecognitionPipelineView: React.FC<Props> = ({ pipelineData
             </p>
           </div>
 
-          {/* Quick Metrics Badge */}
-          <div className="flex items-center gap-3">
-            <div className="px-4 py-2.5 rounded-xl bg-white/10 backdrop-blur border border-white/10 text-right">
+          {/* Quick Metrics Badges */}
+          <div className="flex flex-wrap items-center gap-2.5">
+            {/* Total Billed */}
+            <div className="px-3.5 py-2 rounded-xl bg-white/10 backdrop-blur border border-white/10 text-right">
               <div className="text-[10px] text-slate-300 font-semibold uppercase tracking-wider">
                 Total Billed
               </div>
-              <div className="text-base font-bold text-white">
-                £{Number(recognized.total_amount || 0).toLocaleString('en-GB', { minimumFractionDigits: 2 })}
+              <div className="text-sm font-bold text-white">
+                {renderMoney(totalBilled, detectedCurrency)}
               </div>
             </div>
 
-            <div className={`px-4 py-2.5 rounded-xl border text-right ${
+            {/* Contract Baseline if present */}
+            {contractTotal != null && (
+              <div className="px-3.5 py-2 rounded-xl bg-white/10 backdrop-blur border border-white/10 text-right">
+                <div className="text-[10px] text-slate-300 font-semibold uppercase tracking-wider">
+                  Contract Baseline
+                </div>
+                <div className="text-sm font-bold text-slate-200">
+                  {renderMoney(contractTotal, detectedCurrency)}
+                </div>
+              </div>
+            )}
+
+            {/* Gross Overcharges */}
+            <div className={`px-3.5 py-2 rounded-xl border text-right ${
+              grossOvercharges > 0 ? 'bg-rose-500/20 border-rose-500/40 text-rose-200' : 'bg-white/10 border-white/10 text-slate-200'
+            }`}>
+              <div className="text-[10px] font-semibold uppercase tracking-wider">
+                Gross Overcharge
+              </div>
+              <div className={`text-sm font-bold ${grossOvercharges > 0 ? 'text-rose-300' : 'text-slate-300'}`}>
+                {grossOvercharges > 0 ? `+${renderMoney(grossOvercharges, detectedCurrency)}` : renderMoney(0, detectedCurrency)}
+              </div>
+            </div>
+
+            {/* Gross Undercharge */}
+            <div className={`px-3.5 py-2 rounded-xl border text-right ${
+              potentialUndercharges > 0 ? 'bg-sky-500/20 border-sky-500/40 text-sky-200' : 'bg-white/10 border-white/10 text-slate-200'
+            }`}>
+              <div className="text-[10px] font-semibold uppercase tracking-wider">
+                Gross Undercharge
+              </div>
+              <div className={`text-sm font-bold ${potentialUndercharges > 0 ? 'text-sky-300' : 'text-slate-300'}`}>
+                {potentialUndercharges > 0 ? `-${renderMoney(potentialUndercharges, detectedCurrency)}` : renderMoney(0, detectedCurrency)}
+              </div>
+            </div>
+
+            {/* Net Variance */}
+            <div className={`px-3.5 py-2 rounded-xl border text-right ${
               findingsCount > 0
-                ? 'bg-rose-500/20 border-rose-500/40 text-rose-200'
+                ? 'bg-indigo-500/20 border-indigo-500/40 text-indigo-200'
                 : 'bg-emerald-500/20 border-emerald-500/40 text-emerald-200'
             }`}>
               <div className="text-[10px] font-semibold uppercase tracking-wider">
-                {findingsCount > 0 ? 'Variance Exposure' : 'Audit Status'}
+                {findingsCount > 0 ? 'Net Variance' : 'Audit Status'}
               </div>
-              <div className={`text-base font-bold ${findingsCount > 0 ? 'text-rose-300' : 'text-emerald-300'}`}>
-                {findingsCount > 0 ? `+£${potentialLeakage.toLocaleString('en-GB', { minimumFractionDigits: 2 })}` : 'Clean Match (0 Discrepancy)'}
+              <div className={`text-sm font-bold ${findingsCount > 0 ? 'text-indigo-300' : 'text-emerald-300'}`}>
+                {findingsCount > 0
+                  ? `${netVariance >= 0 ? '+' : ''}${renderMoney(netVariance, detectedCurrency)}`
+                  : 'Clean Match (0 Discrepancy)'}
               </div>
             </div>
           </div>
@@ -109,11 +194,10 @@ export const AutomatedRecognitionPipelineView: React.FC<Props> = ({ pipelineData
           <button
             type="button"
             onClick={() => setActiveTab('FINDINGS')}
-            className={`px-4 py-2 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${
-              activeTab === 'FINDINGS'
+            className={`px-4 py-2 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${activeTab === 'FINDINGS'
                 ? 'bg-rose-600 text-white shadow'
                 : 'bg-slate-800/80 text-slate-300 hover:bg-slate-800'
-            }`}
+              }`}
           >
             <AlertTriangle className="w-3.5 h-3.5" />
             3. What Happened ({findingsCount} Exceptions)
@@ -122,11 +206,10 @@ export const AutomatedRecognitionPipelineView: React.FC<Props> = ({ pipelineData
           <button
             type="button"
             onClick={() => setActiveTab('RECOGNITION')}
-            className={`px-4 py-2 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${
-              activeTab === 'RECOGNITION'
+            className={`px-4 py-2 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${activeTab === 'RECOGNITION'
                 ? 'bg-sky-600 text-white shadow'
                 : 'bg-slate-800/80 text-slate-300 hover:bg-slate-800'
-            }`}
+              }`}
           >
             <Sparkles className="w-3.5 h-3.5" />
             1. Everything Recognized ({lineItems.length} Line Items)
@@ -135,11 +218,10 @@ export const AutomatedRecognitionPipelineView: React.FC<Props> = ({ pipelineData
           <button
             type="button"
             onClick={() => setActiveTab('PIPELINE')}
-            className={`px-4 py-2 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${
-              activeTab === 'PIPELINE'
+            className={`px-4 py-2 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${activeTab === 'PIPELINE'
                 ? 'bg-indigo-600 text-white shadow'
                 : 'bg-slate-800/80 text-slate-300 hover:bg-slate-800'
-            }`}
+              }`}
           >
             <Zap className="w-3.5 h-3.5" />
             2. Automated Processes Executed (6 Steps)
@@ -164,18 +246,20 @@ export const AutomatedRecognitionPipelineView: React.FC<Props> = ({ pipelineData
             </div>
           ) : (
             <div className="space-y-4">
-              <div className="p-4 rounded-xl bg-rose-50 border border-rose-200 text-rose-950 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 text-slate-900 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                 <div className="flex items-center gap-3">
-                  <div className="w-10 h-10 rounded-xl bg-rose-100 text-rose-700 flex items-center justify-center flex-shrink-0">
+                  <div className="w-10 h-10 rounded-xl bg-indigo-100 text-indigo-700 flex items-center justify-center flex-shrink-0">
                     <TrendingDown className="w-5 h-5" />
                   </div>
                   <div>
                     <h4 className="text-sm font-bold">
                       {findingsCount} Variance Exception{findingsCount > 1 ? 's' : ''} Identified Automatically
                     </h4>
-                    <p className="text-xs text-rose-800">
-                      Total financial variance exposure: <b className="text-rose-900">£{potentialLeakage.toLocaleString('en-GB', { minimumFractionDigits: 2 })}</b> requiring review.
-                    </p>
+                    <div className="flex flex-wrap items-center gap-3 mt-1 text-xs">
+                      <span>Gross Overcharges: <b className="text-rose-600">+{renderMoney(grossOvercharges, detectedCurrency)}</b></span>
+                      <span>Gross Undercharge: <b className="text-sky-600">-{renderMoney(potentialUndercharges, detectedCurrency)}</b></span>
+                      <span>Net Variance: <b className="text-indigo-700">{netVariance >= 0 ? '+' : ''}{renderMoney(netVariance, detectedCurrency)}</b></span>
+                    </div>
                   </div>
                 </div>
 
@@ -191,6 +275,8 @@ export const AutomatedRecognitionPipelineView: React.FC<Props> = ({ pipelineData
               <div className="space-y-3">
                 {findings.map((f, idx) => {
                   const isExpanded = expandedFindingId === f.id || idx === 0;
+                  const isUndercharge = f.finding_category === 'POTENTIAL_UNDERCHARGE' || Number(f.potential_difference) < 0;
+                  const diffVal = Number(f.potential_difference);
                   return (
                     <div
                       key={f.id}
@@ -203,16 +289,18 @@ export const AutomatedRecognitionPipelineView: React.FC<Props> = ({ pipelineData
                         <div className="flex items-center gap-3">
                           <span
                             className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider ${
-                              f.severity === 'CRITICAL'
-                                ? 'bg-rose-100 text-rose-800'
-                                : f.severity === 'HIGH'
-                                ? 'bg-orange-100 text-orange-800'
-                                : f.severity === 'MEDIUM'
-                                ? 'bg-amber-100 text-amber-800'
-                                : 'bg-slate-100 text-slate-700'
+                              isUndercharge
+                                ? 'bg-sky-100 text-sky-800'
+                                : f.severity === 'CRITICAL'
+                                  ? 'bg-rose-100 text-rose-800'
+                                  : f.severity === 'HIGH'
+                                    ? 'bg-orange-100 text-orange-800'
+                                    : f.severity === 'MEDIUM'
+                                      ? 'bg-amber-100 text-amber-800'
+                                      : 'bg-slate-100 text-slate-700'
                             }`}
                           >
-                            {f.severity}
+                            {isUndercharge ? 'UNDERCHARGE' : f.severity}
                           </span>
 
                           <div>
@@ -232,9 +320,11 @@ export const AutomatedRecognitionPipelineView: React.FC<Props> = ({ pipelineData
 
                         <div className="flex items-center gap-4">
                           <div className="text-right">
-                            <span className="text-[10px] text-slate-500 block">Cost Variance</span>
-                            <span className="text-sm font-bold text-rose-600">
-                              +£{Number(f.potential_difference).toFixed(2)}
+                            <span className="text-[10px] text-slate-500 block">
+                              {isUndercharge ? 'Undercharge' : 'Cost Variance'}
+                            </span>
+                            <span className={`text-sm font-bold ${isUndercharge ? 'text-sky-600' : 'text-rose-600'}`}>
+                              {diffVal > 0 ? `+${renderMoney(diffVal, f.currency)}` : renderMoney(diffVal, f.currency)}
                             </span>
                           </div>
                           {isExpanded ? (
@@ -258,21 +348,23 @@ export const AutomatedRecognitionPipelineView: React.FC<Props> = ({ pipelineData
                             <div className="p-2.5 rounded-lg bg-slate-50 border border-slate-200">
                               <span className="text-[10px] text-slate-500 block uppercase">Invoiced Amount</span>
                               <span className="font-bold text-slate-900">
-                                £{Number(f.invoiced_amount).toFixed(2)}
+                                {renderMoney(Number(f.invoiced_amount), f.currency)}
                               </span>
                             </div>
 
                             <div className="p-2.5 rounded-lg bg-slate-50 border border-slate-200">
                               <span className="text-[10px] text-slate-500 block uppercase">Expected (Contract / PO)</span>
                               <span className="font-bold text-emerald-700">
-                                £{Number(f.expected_amount).toFixed(2)}
+                                {renderMoney(Number(f.expected_amount), f.currency)}
                               </span>
                             </div>
 
-                            <div className="p-2.5 rounded-lg bg-rose-50 border border-rose-200">
-                              <span className="text-[10px] text-rose-600 block uppercase">Difference (Leakage)</span>
-                              <span className="font-bold text-rose-700">
-                                +£{Number(f.potential_difference).toFixed(2)}
+                            <div className={`p-2.5 rounded-lg border ${isUndercharge ? 'bg-sky-50 border-sky-200' : 'bg-rose-50 border-rose-200'}`}>
+                              <span className={`text-[10px] block uppercase ${isUndercharge ? 'text-sky-600' : 'text-rose-600'}`}>
+                                {isUndercharge ? 'Variance (Undercharge)' : 'Difference (Leakage)'}
+                              </span>
+                              <span className={`font-bold ${isUndercharge ? 'text-sky-700' : 'text-rose-700'}`}>
+                                {diffVal > 0 ? `+${renderMoney(diffVal, f.currency)}` : renderMoney(diffVal, f.currency)}
                               </span>
                             </div>
                           </div>
@@ -346,21 +438,21 @@ export const AutomatedRecognitionPipelineView: React.FC<Props> = ({ pipelineData
               <div className="p-3 bg-slate-50 rounded-xl border border-slate-200">
                 <span className="text-[10px] text-slate-500 uppercase block font-semibold">Currency</span>
                 <span className="text-xs font-bold text-slate-900 block mt-0.5">
-                  {recognized.currency || 'GBP (£)'}
+                  {detectedCurrency} ({currencySymbol})
                 </span>
               </div>
 
               <div className="p-3 bg-slate-50 rounded-xl border border-slate-200">
                 <span className="text-[10px] text-slate-500 uppercase block font-semibold">Subtotal</span>
                 <span className="text-xs font-bold text-slate-900 block mt-0.5">
-                  £{Number(recognized.subtotal || 0).toFixed(2)}
+                  {renderMoney(Number(recognized.subtotal || 0), detectedCurrency)}
                 </span>
               </div>
 
               <div className="p-3 bg-slate-50 rounded-xl border border-slate-200">
                 <span className="text-[10px] text-slate-500 uppercase block font-semibold">Total Amount</span>
                 <span className="text-xs font-bold text-emerald-700 block mt-0.5">
-                  £{Number(recognized.total_amount || 0).toFixed(2)}
+                  {renderMoney(Number(recognized.total_amount || 0), detectedCurrency)}
                 </span>
               </div>
             </div>
@@ -412,10 +504,10 @@ export const AutomatedRecognitionPipelineView: React.FC<Props> = ({ pipelineData
                           {item.quantity ?? item.quantity_received ?? 1}
                         </td>
                         <td className="py-2.5 px-3 text-right text-slate-900">
-                          £{Number(item.unit_price ?? item.contracted_unit_price ?? 0).toFixed(2)}
+                          {renderMoney(Number(item.unit_price ?? item.contracted_unit_price ?? 0), item.currency || detectedCurrency)}
                         </td>
                         <td className="py-2.5 px-3 text-right font-bold text-slate-900">
-                          £{Number(item.line_total ?? (Number(item.quantity || 1) * Number(item.unit_price || 0))).toFixed(2)}
+                          {renderMoney(Number(item.line_total ?? (Number(item.quantity || 1) * Number(item.unit_price || 0))), item.currency || detectedCurrency)}
                         </td>
                       </tr>
                     ))

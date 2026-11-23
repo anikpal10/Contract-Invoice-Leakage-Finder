@@ -4,7 +4,6 @@ import { useAuth } from '../../context/AuthContext';
 import {
   LayoutDashboard,
   Building2,
-  FolderPlus,
   UploadCloud,
   Clock,
   Sparkles,
@@ -29,7 +28,6 @@ export const AppLayout: React.FC<{ children: React.ReactNode }> = ({ children })
 
   const navigation = [
     { name: 'Dashboard', href: '/dashboard', icon: LayoutDashboard },
-    { name: 'New Reconciliation', href: '/cases/new', icon: FolderPlus },
     { name: 'Document Upload', href: '/documents/upload', icon: UploadCloud },
     { name: 'Processing Status', href: '/documents/status', icon: Clock },
     { name: 'Reconciliation Results', href: '/reconciliation', icon: Sparkles },

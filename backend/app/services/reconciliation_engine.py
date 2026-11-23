@@ -1,4 +1,5 @@
 from decimal import Decimal, ROUND_HALF_UP
+import logging
 from typing import List, Dict, Any, Optional
 from sqlalchemy.orm import Session
 
@@ -17,6 +18,7 @@ from backend.app.services.normalization import normalization_service
 from backend.app.services.llm_service import llm_service
 
 TWO_PLACES = Decimal("0.01")
+logger = logging.getLogger("leakage_finder.reconciliation")
 
 def quantize_money(val: Decimal) -> Decimal:
     return val.quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
@@ -72,6 +74,30 @@ class ReconciliationEngine:
         contracts = case.contracts
         grns = case.goods_received_notes
 
+        logger.info(
+            "Reconciliation start | case_id=%s case_ref=%s case_currency=%s invoices=%d pos=%d contracts=%d grns=%d reset_reviewed=%s",
+            case.id,
+            case.case_reference,
+            case.currency,
+            len(invoices),
+            len(pos),
+            len(contracts),
+            len(grns),
+            reset_reviewed,
+        )
+
+        detected_currencies = {
+            *(inv.currency for inv in invoices if inv.currency),
+            *(po.currency for po in pos if po.currency),
+            *(contract.currency for contract in contracts if contract.currency),
+        }
+        if len(detected_currencies) > 1:
+            logger.warning(
+                "Mixed currencies detected in case during reconciliation | case_id=%s currencies=%s",
+                case.id,
+                sorted(list(detected_currencies)),
+            )
+
         findings: List[Finding] = []
 
         # 3. Check for Duplicate Invoices across current and past invoices
@@ -80,6 +106,19 @@ class ReconciliationEngine:
 
         # 4. Check each invoice
         for inv in invoices:
+            sum_lines = quantize_money(sum((li.line_total for li in inv.line_items), Decimal("0.00"))) if inv.line_items else Decimal("0.00")
+            logger.info(
+                "Invoice basis snapshot | case_id=%s invoice=%s currency=%s subtotal=%s tax=%s total=%s line_sum=%s line_items=%d",
+                case.id,
+                inv.invoice_number,
+                inv.currency,
+                inv.subtotal,
+                inv.tax_amount,
+                inv.total_amount,
+                sum_lines,
+                len(inv.line_items or []),
+            )
+
             # Check arithmetic consistency of invoice header
             total_findings = self._check_invoice_math(inv, rule_config)
             findings.extend(total_findings)
@@ -87,8 +126,26 @@ class ReconciliationEngine:
             # Match to Purchase Order
             matched_po = matching_service.match_invoice_to_po(inv, pos, rule_config.fuzzy_match_threshold)
             
-            # Match to Contract if available
-            matched_contract = contracts[0] if contracts else None
+            # Match to authorized Contract
+            matched_contract = matching_service.match_invoice_to_contract(
+                inv, contracts, rule_config.fuzzy_match_threshold
+            )
+            if matched_contract:
+                logger.info(
+                    "Invoice matched to contract | case_id=%s invoice=%s contract=%s supplier=%s",
+                    case.id,
+                    inv.invoice_number,
+                    matched_contract.contract_reference,
+                    matched_contract.supplier_name,
+                )
+            elif contracts:
+                logger.warning(
+                    "No matching contract found for invoice | case_id=%s invoice=%s contract_ref=%s supplier=%s",
+                    case.id,
+                    inv.invoice_number,
+                    inv.contract_reference,
+                    inv.supplier_name,
+                )
 
             # Reconcile each invoice line item
             for inv_line in inv.line_items:
@@ -180,6 +237,12 @@ class ReconciliationEngine:
             persisted_findings.append(f)
 
         case.status = CaseStatus.RECONCILED.value
+        logger.info(
+            "Reconciliation complete | case_id=%s persisted_findings=%d deduped_runtime=%d",
+            case.id,
+            len(persisted_findings),
+            len(findings) - len(seen_keys),
+        )
         db.commit()
         return persisted_findings
 
@@ -208,14 +271,15 @@ class ReconciliationEngine:
         qty = inv_line.quantity
 
         price_diff = inv_price - expected_price
-        if price_diff <= Decimal("0.00"):
-            return None  # Supplier billed at or below agreed contract price
+        if price_diff == Decimal("0.00"):
+            return None  # Supplier billed exactly at the agreed contract price
 
-        # Check tolerances
-        if price_diff <= rule_config.price_variance_tolerance_abs:
+        # Check tolerances on the absolute variance (applies to both over- and under-billing)
+        abs_price_diff = abs(price_diff)
+        if abs_price_diff <= rule_config.price_variance_tolerance_abs:
             return None
         if expected_price > Decimal("0.00"):
-            pct_diff = (price_diff / expected_price) * Decimal("100.0")
+            pct_diff = (abs_price_diff / expected_price) * Decimal("100.0")
             if pct_diff <= rule_config.price_variance_tolerance_pct:
                 return None
 
@@ -223,36 +287,30 @@ class ReconciliationEngine:
         invoiced_total = quantize_money(inv_price * qty)
         potential_diff = quantize_money(invoiced_total - expected_total)
 
-        # Baseline deterministic calculation explanation
-        explanation = (
-            f"Contract rate variance detected. Contract '{contract.contract_reference}' stipulates "
-            f"unit price of {inv.currency} {expected_price:.2f} for '{contract_line.description}', but "
-            f"invoice '{inv.invoice_number}' billed at {inv.currency} {inv_price:.2f} per unit for quantity {qty:.0f}. "
-            f"Potential overcharge difference: {inv.currency} {potential_diff:.2f}."
+        is_undercharge = potential_diff < Decimal("0.00")
+        category = (
+            FindingCategory.POTENTIAL_UNDERCHARGE.value
+            if is_undercharge
+            else FindingCategory.CONTRACT_PRICE_MISMATCH.value
         )
 
-        # Enhance with LLM audit explanation if provider is active
-        if llm_service.is_available():
-            try:
-                validity_info = f"{contract.effective_date} to {contract.expiry_date}" if contract.effective_date else None
-                llm_exp = llm_service.analyze_leakage_finding(
-                    finding_category=FindingCategory.CONTRACT_PRICE_MISMATCH.value,
-                    supplier_name=inv.supplier_name,
-                    invoice_ref=inv.invoice_number,
-                    product_name=contract_line.description,
-                    contract_ref=contract.contract_reference,
-                    agreed_price=expected_price,
-                    invoiced_price=inv_price,
-                    quantity=qty,
-                    cost_difference=potential_diff,
-                    currency=inv.currency,
-                    contract_validity=validity_info
-                )
-                if llm_exp:
-                    explanation = llm_exp
-            except Exception:
-                pass
+        # Baseline deterministic calculation explanation
+        if is_undercharge:
+            explanation = (
+                f"Potential undercharge detected. Contract '{contract.contract_reference}' stipulates "
+                f"unit price of {inv.currency} {expected_price:.2f} for '{contract_line.description}', but "
+                f"invoice '{inv.invoice_number}' billed at {inv.currency} {inv_price:.2f} per unit for quantity {qty:.0f}. "
+                f"Potential undercharge difference: {inv.currency} {potential_diff:.2f}."
+            )
+        else:
+            explanation = (
+                f"Contract rate variance detected. Contract '{contract.contract_reference}' stipulates "
+                f"unit price of {inv.currency} {expected_price:.2f} for '{contract_line.description}', but "
+                f"invoice '{inv.invoice_number}' billed at {inv.currency} {inv_price:.2f} per unit for quantity {qty:.0f}. "
+                f"Potential overcharge difference: {inv.currency} {potential_diff:.2f}."
+            )
 
+        # Deterministic audit explanation is generated instantly without remote network stalls
         doc_refs = [
             {
                 "type": "INVOICE",
@@ -273,7 +331,7 @@ class ReconciliationEngine:
         return Finding(
             case_id=inv.case_id,
             organization_id=inv.case.organization_id,
-            finding_category=FindingCategory.CONTRACT_PRICE_MISMATCH.value,
+            finding_category=category,
             supplier_name=inv.supplier_name,
             invoice_reference=inv.invoice_number,
             line_number=inv_line.line_number,
@@ -303,14 +361,15 @@ class ReconciliationEngine:
         qty = inv_line.quantity
 
         price_diff = inv_price - expected_price
-        if price_diff <= Decimal("0.00"):
+        if price_diff == Decimal("0.00"):
             return None
 
-        # Check tolerances
-        if price_diff <= rule_config.price_variance_tolerance_abs:
+        # Check tolerances on the absolute variance (applies to both over- and under-billing)
+        abs_price_diff = abs(price_diff)
+        if abs_price_diff <= rule_config.price_variance_tolerance_abs:
             return None
         if expected_price > Decimal("0.00"):
-            pct_diff = (price_diff / expected_price) * Decimal("100.0")
+            pct_diff = (abs_price_diff / expected_price) * Decimal("100.0")
             if pct_diff <= rule_config.price_variance_tolerance_pct:
                 return None
 
@@ -318,12 +377,27 @@ class ReconciliationEngine:
         invoiced_total = quantize_money(inv_price * qty)
         potential_diff = quantize_money(invoiced_total - expected_total)
 
-        explanation = (
-            f"Purchase order price mismatch. PO '{po.po_number}' authorised a unit price of "
-            f"{inv.currency} {expected_price:.2f} for '{po_line.description}', whereas invoice "
-            f"'{inv.invoice_number}' billed at {inv.currency} {inv_price:.2f} per unit for {qty:.0f} units. "
-            f"Variance: {inv.currency} {potential_diff:.2f}."
+        is_undercharge = potential_diff < Decimal("0.00")
+        category = (
+            FindingCategory.POTENTIAL_UNDERCHARGE.value
+            if is_undercharge
+            else FindingCategory.PO_PRICE_MISMATCH.value
         )
+
+        if is_undercharge:
+            explanation = (
+                f"Potential undercharge detected. Purchase order '{po.po_number}' authorised a unit price of "
+                f"{inv.currency} {expected_price:.2f} for '{po_line.description}', whereas invoice "
+                f"'{inv.invoice_number}' billed at {inv.currency} {inv_price:.2f} per unit for {qty:.0f} units. "
+                f"Potential undercharge variance: {inv.currency} {potential_diff:.2f}."
+            )
+        else:
+            explanation = (
+                f"Purchase order price mismatch. PO '{po.po_number}' authorised a unit price of "
+                f"{inv.currency} {expected_price:.2f} for '{po_line.description}', whereas invoice "
+                f"'{inv.invoice_number}' billed at {inv.currency} {inv_price:.2f} per unit for {qty:.0f} units. "
+                f"Variance: {inv.currency} {potential_diff:.2f}."
+            )
 
         doc_refs = [
             {"type": "INVOICE", "document_id": inv.document_id, "invoice_number": inv.invoice_number, "line": inv_line.line_number},
@@ -333,7 +407,7 @@ class ReconciliationEngine:
         return Finding(
             case_id=inv.case_id,
             organization_id=inv.case.organization_id,
-            finding_category=FindingCategory.PO_PRICE_MISMATCH.value,
+            finding_category=category,
             supplier_name=inv.supplier_name,
             invoice_reference=inv.invoice_number,
             line_number=inv_line.line_number,
@@ -537,8 +611,14 @@ class ReconciliationEngine:
         inv_line: InvoiceLineItem,
         rule_config: RuleConfiguration
     ) -> Optional[Finding]:
-        expected_line_total = quantize_money(inv_line.quantity * inv_line.unit_price)
-        actual_line_total = quantize_money(inv_line.line_total)
+        # Both quantity and unit price must be extracted and non-zero to evaluate arithmetic validity
+        qty = inv_line.quantity or Decimal("0.00")
+        price = inv_line.unit_price or Decimal("0.00")
+        if qty <= Decimal("0.00") or price <= Decimal("0.00"):
+            return None
+
+        expected_line_total = quantize_money(qty * price)
+        actual_line_total = quantize_money(inv_line.line_total or Decimal("0.00"))
         diff = actual_line_total - expected_line_total
 
         if abs(diff) > Decimal("0.05"):  # Allow trivial 5p rounding differences
@@ -583,8 +663,19 @@ class ReconciliationEngine:
 
         # Sum lines
         sum_lines = sum(quantize_money(li.line_total) for li in inv.line_items)
-        stated_subtotal = quantize_money(inv.subtotal)
-        
+        stated_subtotal = quantize_money(inv.subtotal) if inv.subtotal is not None else None
+
+        # Requirement 3 & 4: Never treat a missing subtotal as zero. Calculate from validated line items.
+        if stated_subtotal is None or stated_subtotal <= Decimal("0.00"):
+            if sum_lines > Decimal("0.00"):
+                # Missing subtotal is derived from validated line items
+                inv.subtotal = sum_lines
+                if inv.total_amount is None or inv.total_amount <= Decimal("0.00"):
+                    inv.total_amount = sum_lines + (inv.tax_amount or Decimal("0.00"))
+            return findings
+
+        # A true subtotal mismatch only occurs if the document explicitly stated a non-zero subtotal
+        # that differs from the sum of its validated line item totals.
         if abs(stated_subtotal - sum_lines) > Decimal("0.10"):
             diff = abs(stated_subtotal - sum_lines)
             explanation = (
@@ -605,7 +696,12 @@ class ReconciliationEngine:
                 severity=self._determine_severity(diff, rule_config),
                 review_status=ReviewStatus.NEW.value,
                 calculation_explanation=explanation,
-                source_document_references=[{"type": "INVOICE", "document_id": inv.document_id, "invoice_number": inv.invoice_number}],
+                source_document_references=[{
+                    "type": "INVOICE",
+                    "document_id": inv.document_id,
+                    "invoice_number": inv.invoice_number,
+                    "is_aggregate": True
+                }],
                 rule_version=rule_config.version
             ))
 
@@ -651,4 +747,3 @@ class ReconciliationEngine:
         return findings
 
 reconciliation_engine = ReconciliationEngine()
-

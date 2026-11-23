@@ -84,7 +84,7 @@ export const DocumentUpload: React.FC = () => {
   const [uploading, setUploading] = useState(false);
   const [uploadMessage, setUploadMessage] = useState<string | null>(null);
   const [uploadedPipelineResult, setUploadedPipelineResult] = useState<any | null>(null);
-  
+
   // Navigation tabs: 'BROWSE' is the default active tab!
   const [activeTab, setActiveTab] = useState<'BROWSE' | 'EXPLORER' | 'PATH'>('BROWSE');
 
@@ -166,6 +166,7 @@ export const DocumentUpload: React.FC = () => {
 
     setUploading(true);
     setUploadMessage(null);
+    setUploadedPipelineResult(null);
 
     const formData = new FormData();
     files.forEach((f) => formData.append('files', f));
@@ -175,22 +176,41 @@ export const DocumentUpload: React.FC = () => {
       const res = await apiClient.post(`/cases/${targetCaseId}/documents/batch-upload`, formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
       });
-      setUploadMessage(res.data.message || 'Files uploaded and processed successfully.');
-      if (res.data?.recognized_data || res.data?.automated_steps) {
-        setUploadedPipelineResult(res.data);
-      } else {
-        const latestRes = await apiClient.get('/cases/pipeline/latest').catch(() => null);
-        if (latestRes?.data) setUploadedPipelineResult(latestRes.data);
+
+      const data = res.data || {};
+      setUploadMessage(data.message || 'Files uploaded and processed successfully! Redirecting to dashboard...');
+
+      let newDocId = data.document_id || data.pipeline?.document_id;
+      let newDocName = data.original_filename || data.pipeline?.original_filename || files[0]?.name;
+
+      // Prefer the pipeline-shaped payload returned by the batch endpoint
+      if (data.pipeline) {
+        setUploadedPipelineResult(data.pipeline);
+      } else if (data.recognized_data || data.automated_steps) {
+        setUploadedPipelineResult(data);
       }
+
+      if (newDocId) {
+        sessionStorage.setItem('last_uploaded_document_id', newDocId);
+        if (newDocName) sessionStorage.setItem('last_uploaded_document_name', newDocName);
+      }
+
       setStagedFiles([]);
       if (fileInputRef.current) fileInputRef.current.value = '';
-      fetchUploadedDocuments(targetCaseId);
-      // Automatically navigate to Dashboard so the user does not need to click "View Live on Dashboard"
-      setTimeout(() => {
-        navigate('/dashboard');
-      }, 700);
+
+      // Auto upload & extracting done → directly go to the dashboard and show the output!
+      navigate(newDocId ? `/dashboard?documentId=${newDocId}` : '/dashboard');
     } catch (err: any) {
-      setUploadMessage(err.response?.data?.detail || 'Failed to upload selected files.');
+      const detail = err.response?.data?.detail;
+      setUploadMessage(
+        typeof detail === 'string'
+          ? detail
+          : Array.isArray(detail)
+            ? detail.map((d: any) => d.msg || JSON.stringify(d)).join('; ')
+            : 'Failed to upload selected files.'
+      );
+      setStagedFiles([]);
+      if (fileInputRef.current) fileInputRef.current.value = '';
     } finally {
       setUploading(false);
     }
@@ -369,7 +389,7 @@ export const DocumentUpload: React.FC = () => {
     if (!selectedCaseId) return;
     const downloadUrl = `/v1/cases/${selectedCaseId}/documents/${docId}/download`;
     const token = localStorage.getItem('token') || localStorage.getItem('access_token');
-    
+
     // Trigger browser download with authorization
     fetch(downloadUrl, {
       headers: token ? { Authorization: `Bearer ${token}` } : {}
@@ -472,11 +492,10 @@ export const DocumentUpload: React.FC = () => {
       <div className="flex border-b border-slate-200">
         <button
           onClick={() => setActiveTab('BROWSE')}
-          className={`flex items-center gap-2 py-3 px-6 text-xs font-bold border-b-2 transition-all ${
-            activeTab === 'BROWSE'
+          className={`flex items-center gap-2 py-3 px-6 text-xs font-bold border-b-2 transition-all ${activeTab === 'BROWSE'
               ? 'border-sky-600 text-sky-700 bg-sky-50/50'
               : 'border-transparent text-slate-500 hover:text-slate-700'
-          }`}
+            }`}
         >
           <UploadCloud className="w-4 h-4 text-sky-600" />
           📁 Browse & Upload Files
@@ -487,11 +506,10 @@ export const DocumentUpload: React.FC = () => {
 
         <button
           onClick={() => setActiveTab('EXPLORER')}
-          className={`flex items-center gap-2 py-3 px-6 text-xs font-bold border-b-2 transition-all ${
-            activeTab === 'EXPLORER'
+          className={`flex items-center gap-2 py-3 px-6 text-xs font-bold border-b-2 transition-all ${activeTab === 'EXPLORER'
               ? 'border-indigo-600 text-indigo-700 bg-indigo-50/50'
               : 'border-transparent text-slate-500 hover:text-slate-700'
-          }`}
+            }`}
         >
           <FolderOpen className="w-4 h-4 text-indigo-600" />
           🗂️ Local Filesystem Explorer
@@ -502,11 +520,10 @@ export const DocumentUpload: React.FC = () => {
 
         <button
           onClick={() => setActiveTab('PATH')}
-          className={`flex items-center gap-2 py-3 px-6 text-xs font-bold border-b-2 transition-all ${
-            activeTab === 'PATH'
+          className={`flex items-center gap-2 py-3 px-6 text-xs font-bold border-b-2 transition-all ${activeTab === 'PATH'
               ? 'border-emerald-600 text-emerald-700 bg-emerald-50/50'
               : 'border-transparent text-slate-500 hover:text-slate-700'
-          }`}
+            }`}
         >
           <HardDrive className="w-4 h-4 text-emerald-600" />
           ⚡ Zero-Memory Path Ingest
@@ -542,11 +559,10 @@ export const DocumentUpload: React.FC = () => {
                     key={cat.id}
                     type="button"
                     onClick={() => setCategory(cat.id)}
-                    className={`flex flex-col items-center justify-center p-3 rounded-xl border text-center transition-all ${
-                      isSelected
+                    className={`flex flex-col items-center justify-center p-3 rounded-xl border text-center transition-all ${isSelected
                         ? 'border-sky-500 bg-sky-50 text-sky-900 font-semibold ring-2 ring-sky-500/20'
                         : 'border-slate-200 hover:border-slate-300 bg-slate-50/50 text-slate-600'
-                    }`}
+                      }`}
                   >
                     <Icon className={`w-4 h-4 mb-1 ${isSelected ? 'text-sky-600' : 'text-slate-400'}`} />
                     <span className="text-[11px] leading-tight">{cat.name}</span>
@@ -1197,13 +1213,12 @@ export const DocumentUpload: React.FC = () => {
                     <td className="py-3 px-4 font-mono text-[11px] text-slate-400">{doc.sha256_hash.substring(0, 14)}...</td>
                     <td className="py-3 px-4">
                       <span
-                        className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider ${
-                          doc.processing_status === 'EXTRACTED'
+                        className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider ${doc.processing_status === 'EXTRACTED'
                             ? 'bg-emerald-100 text-emerald-800'
                             : doc.processing_status === 'FAILED'
-                            ? 'bg-rose-100 text-rose-800'
-                            : 'bg-sky-100 text-sky-800'
-                        }`}
+                              ? 'bg-rose-100 text-rose-800'
+                              : 'bg-sky-100 text-sky-800'
+                          }`}
                       >
                         {doc.processing_status}
                       </span>

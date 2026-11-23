@@ -1,0 +1,2 @@
+product_name,quantity,invoice_price,invoice_number,invoice_date,supplier_name,purchase_order,line_total,header_total
+Commercial Facility Cleaning,320,25.00,INV-CC-4001,2026-10-15,CleanCorp UK,PO-CC-2026-09,8000.00,8500.00

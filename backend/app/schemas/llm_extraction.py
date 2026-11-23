@@ -11,21 +11,21 @@ class ExtractedLineItem(BaseModel):
     total_price: Optional[Decimal] = Field(default=None, description="Line total price")
     tax_amount: Optional[Decimal] = Field(default=None, description="Tax amount for this line")
     discount: Optional[Decimal] = Field(default=None, description="Discount amount or percentage if specified")
-    currency: Optional[str] = Field(default="GBP", description="Currency ISO code")
+    currency: Optional[str] = Field(default=None, description="Currency ISO code")
     source_page_number: Optional[int] = Field(default=1, description="Source page number in the document")
     text_evidence: Optional[str] = Field(default=None, description="Exact snippet or sentence from document verifying this item")
     confidence_score: float = Field(default=0.95, ge=0.0, le=1.0, description="Extraction confidence score")
 
 class ExtractedDocumentData(BaseModel):
-    document_category: str = Field(description="CONTRACT, INVOICE, PURCHASE_ORDER, or GOODS_RECEIVED_NOTE")
-    reference_number: str = Field(description="Invoice number, PO number, or Contract reference")
-    supplier_name: str = Field(description="Supplier or vendor name")
+    document_category: str = Field(default="INVOICE", description="CONTRACT, INVOICE, PURCHASE_ORDER, or GOODS_RECEIVED_NOTE")
+    reference_number: Optional[str] = Field(default="REF-UNKNOWN", description="Invoice number, PO number, or Contract reference")
+    supplier_name: Optional[str] = Field(default="Unknown Supplier", description="Supplier or vendor name")
     document_date: Optional[str] = Field(default=None, description="Issue date YYYY-MM-DD")
     due_date: Optional[str] = Field(default=None, description="Payment due date YYYY-MM-DD")
     contract_validity_start: Optional[str] = Field(default=None, description="Contract effective start date YYYY-MM-DD")
     contract_validity_end: Optional[str] = Field(default=None, description="Contract expiry date YYYY-MM-DD")
     payment_terms: Optional[str] = Field(default=None, description="Payment terms e.g. Net 30, Due upon receipt")
-    currency: str = Field(default="GBP", description="Document currency")
+    currency: Optional[str] = Field(default="REVIEW_REQUIRED", description="Document currency")
     subtotal: Optional[Decimal] = None
     tax_amount: Optional[Decimal] = None
     discount_amount: Optional[Decimal] = None
@@ -57,4 +57,3 @@ class LLMLeakageAnalysis(BaseModel):
     supporting_evidence: str
     confidence_score: float
     requires_human_review: bool
-
