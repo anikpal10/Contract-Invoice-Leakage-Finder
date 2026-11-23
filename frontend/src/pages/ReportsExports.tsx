@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { apiClient } from '../api/client';
 import { ReconciliationCase, ExportRecord } from '../types';
 import {
@@ -82,8 +83,12 @@ interface DossierData {
 }
 
 export const ReportsExports: React.FC = () => {
+  const [searchParams] = useSearchParams();
+  const queryCaseId = searchParams.get('caseId');
   const [cases, setCases] = useState<ReconciliationCase[]>([]);
-  const [selectedCaseId, setSelectedCaseId] = useState('');
+  const [selectedCaseId, setSelectedCaseId] = useState(queryCaseId || '');
+  const [documents, setDocuments] = useState<any[]>([]);
+  const [selectedDocId, setSelectedDocId] = useState<string>('ALL');
   const [includeRejected, setIncludeRejected] = useState(true);
   const [exporting, setExporting] = useState<string | null>(null);
   const [recentExports, setRecentExports] = useState<ExportRecord[]>([]);
@@ -99,7 +104,7 @@ export const ReportsExports: React.FC = () => {
   useEffect(() => {
     if (selectedCaseId) {
       fetchExportsHistory(selectedCaseId);
-      fetchFullDossier(selectedCaseId);
+      fetchCaseDocuments(selectedCaseId);
     }
   }, [selectedCaseId]);
 
@@ -108,12 +113,53 @@ export const ReportsExports: React.FC = () => {
       const res = await apiClient.get('/cases/');
       setCases(res.data);
       if (res.data.length > 0) {
-        setSelectedCaseId(res.data[0].id);
+        if (queryCaseId && res.data.some((c: ReconciliationCase) => c.id === queryCaseId)) {
+          setSelectedCaseId(queryCaseId);
+        } else if (!selectedCaseId) {
+          setSelectedCaseId(res.data[0].id);
+        }
       }
     } catch (err) {
       console.error('Failed to load cases:', err);
     }
   };
+
+  const fetchCaseDocuments = async (caseId: string) => {
+    try {
+      const docsRes = await apiClient.get(`/cases/${caseId}/documents`);
+      const docsList = docsRes.data || [];
+      setDocuments(docsList);
+
+      const urlDocId = searchParams.get('documentId');
+      const storedDocId = sessionStorage.getItem('last_uploaded_document_id');
+      let targetDocId = 'ALL';
+
+      if (urlDocId && docsList.some((d: any) => d.id === urlDocId)) {
+        targetDocId = urlDocId;
+      } else if (storedDocId && docsList.some((d: any) => d.id === storedDocId)) {
+        targetDocId = storedDocId;
+      } else if (docsList.length > 0) {
+        // Default to the uploaded file so its review status is exported!
+        targetDocId = docsList[0].id;
+      }
+
+      setSelectedDocId(targetDocId);
+      await fetchFullDossier(caseId, targetDocId);
+    } catch (e) {
+      console.error('Failed to load case documents:', e);
+      await fetchFullDossier(caseId, 'ALL');
+    }
+  };
+
+  const handleDocumentChange = (docId: string) => {
+    setSelectedDocId(docId);
+    if (docId && docId !== 'ALL') {
+      sessionStorage.setItem('last_uploaded_document_id', docId);
+    }
+    fetchFullDossier(selectedCaseId, docId);
+  };
+
+  const activeDoc = documents.find((d) => d.id === selectedDocId);
 
   const fetchExportsHistory = async (caseId: string) => {
     try {
@@ -124,10 +170,13 @@ export const ReportsExports: React.FC = () => {
     }
   };
 
-  const fetchFullDossier = async (caseId: string) => {
+  const fetchFullDossier = async (caseId: string, docId: string = 'ALL') => {
     setLoadingDossier(true);
     try {
-      const res = await apiClient.get(`/cases/${caseId}/full-dossier`);
+      const endpoint = (docId && docId !== 'ALL')
+        ? `/cases/${caseId}/full-dossier?document_id=${docId}`
+        : `/cases/${caseId}/full-dossier`;
+      const res = await apiClient.get(endpoint);
       setDossier(res.data);
     } catch (err) {
       console.error('Failed to load full dossier:', err);
@@ -171,11 +220,44 @@ export const ReportsExports: React.FC = () => {
 
   const downloadFileBlob = async (downloadUrl: string, fileName: string) => {
     try {
+      // 1. Try downloading via apiClient (automatically uses correct API URL & bearer token)
+      const relativeUrl = downloadUrl.startsWith('/v1/')
+        ? downloadUrl.substring(3)
+        : (downloadUrl.startsWith('/v1') ? downloadUrl.substring(3) : downloadUrl);
+
+      const response = await apiClient.get(relativeUrl, {
+        responseType: 'blob',
+      });
+
+      const contentType = (response.headers['content-type'] as string) || 'application/octet-stream';
+      const blob = new Blob([response.data], {
+        type: contentType,
+      });
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => window.URL.revokeObjectURL(url), 1000);
+      return;
+    } catch (apiErr) {
+      console.warn('apiClient blob download failed, trying fetch fallback:', apiErr);
+    }
+
+    try {
+      // 2. Direct fetch fallback with full origin
       const token = localStorage.getItem('token');
-      const response = await fetch(downloadUrl, {
+      const apiBase = import.meta.env.VITE_API_URL || '';
+      const fullUrl = downloadUrl.startsWith('http')
+        ? downloadUrl
+        : `${apiBase}${downloadUrl.startsWith('/') ? '' : '/'}${downloadUrl}`;
+
+      const response = await fetch(fullUrl, {
         headers: token ? { Authorization: `Bearer ${token}` } : {},
       });
-      if (!response.ok) throw new Error('Download failed');
+      if (!response.ok) throw new Error(`HTTP error ${response.status}`);
       const blob = await response.blob();
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -184,12 +266,15 @@ export const ReportsExports: React.FC = () => {
       document.body.appendChild(a);
       a.click();
       a.remove();
-      window.URL.revokeObjectURL(url);
-    } catch (err) {
-      console.error('Download error:', err);
-      // Fallback with token in query param
+      setTimeout(() => window.URL.revokeObjectURL(url), 1000);
+    } catch (fetchErr) {
+      console.error('All direct download attempts failed, opening in new tab:', fetchErr);
       const token = localStorage.getItem('token');
-      const tokenUrl = token ? `${downloadUrl}?token=${token}` : downloadUrl;
+      const apiBase = import.meta.env.VITE_API_URL || '';
+      const fullUrl = downloadUrl.startsWith('http')
+        ? downloadUrl
+        : `${apiBase}${downloadUrl.startsWith('/') ? '' : '/'}${downloadUrl}`;
+      const tokenUrl = token ? `${fullUrl}${fullUrl.includes('?') ? '&' : '?'}token=${token}` : fullUrl;
       window.open(tokenUrl, '_blank');
     }
   };
@@ -200,13 +285,19 @@ export const ReportsExports: React.FC = () => {
     setMessage(null);
 
     try {
-      const res = await apiClient.post(`/cases/${selectedCaseId}/exports`, {
+      const payload: any = {
         format,
         include_rejected: includeRejected,
-      });
+      };
+      if (selectedDocId && selectedDocId !== 'ALL') {
+        payload.document_id = selectedDocId;
+      }
+
+      const res = await apiClient.post(`/cases/${selectedCaseId}/exports`, payload);
       const exportRec: ExportRecord = res.data;
       setRecentExports((prev) => [exportRec, ...prev]);
-      setMessage(`Generated and downloaded ${format} report: ${exportRec.file_name}`);
+      const fileLabel = activeDoc?.original_filename ? ` for ${activeDoc.original_filename}` : '';
+      setMessage(`Generated and downloaded ${format} report${fileLabel}: ${exportRec.file_name}`);
 
       // Auto trigger download via secure blob download
       if (exportRec.download_url) {
@@ -241,22 +332,78 @@ export const ReportsExports: React.FC = () => {
         </div>
 
         {selectedCaseId && (
-          <div className="flex items-center gap-2">
-            <span className="text-xs text-slate-500 font-medium">Batch:</span>
-            <select
-              value={selectedCaseId}
-              onChange={(e) => setSelectedCaseId(e.target.value)}
-              className="px-3 py-1.5 border border-slate-300 rounded-lg text-xs font-semibold text-slate-800 bg-white shadow-sm focus:outline-none focus:ring-2 focus:ring-sky-500"
-            >
-              {cases.map((c) => (
-                <option key={c.id} value={c.id}>
-                  {c.case_reference} - {c.title}
-                </option>
-              ))}
-            </select>
+          <div className="flex flex-wrap items-center gap-2.5">
+            <div className="flex items-center gap-1.5">
+              <span className="text-xs text-slate-500 font-medium">Batch:</span>
+              <select
+                value={selectedCaseId}
+                onChange={(e) => setSelectedCaseId(e.target.value)}
+                className="px-3 py-1.5 border border-slate-300 rounded-lg text-xs font-semibold text-slate-800 bg-white shadow-sm focus:outline-none focus:ring-2 focus:ring-sky-500"
+              >
+                {cases.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.case_reference} - {c.title}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="flex items-center gap-1.5">
+              <span className="text-xs text-slate-500 font-medium">Document:</span>
+              <select
+                value={selectedDocId}
+                onChange={(e) => handleDocumentChange(e.target.value)}
+                className="px-3 py-1.5 border border-rose-300 rounded-lg text-xs font-semibold text-slate-800 bg-white shadow-sm focus:outline-none focus:ring-2 focus:ring-rose-500 max-w-[260px] truncate"
+                title="Filter export to specific uploaded file"
+              >
+                {documents.length > 0 && (
+                  <optgroup label="Uploaded Documents">
+                    {documents.map((d, idx) => (
+                      <option key={d.id} value={d.id}>
+                        {idx === 0 ? '⭐ (Latest) ' : '📄 '}{d.original_filename}
+                      </option>
+                    ))}
+                  </optgroup>
+                )}
+                <option value="ALL">📁 All Case Documents ({documents.length} files)</option>
+              </select>
+            </div>
           </div>
         )}
       </div>
+
+      {/* Uploaded Document Focus Banner */}
+      {selectedDocId !== 'ALL' && activeDoc && (
+        <div className="p-3.5 rounded-xl bg-rose-50/90 border border-rose-200 text-rose-950 text-xs flex items-center justify-between shadow-sm animate-in fade-in">
+          <div className="flex items-center gap-2">
+            <FileText className="w-4 h-4 text-rose-600 flex-shrink-0" />
+            <span>
+              PDF Export Scope: Generating reports exclusively for uploaded file: <b className="font-bold">{activeDoc.original_filename}</b>
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={() => handleDocumentChange('ALL')}
+            className="text-rose-800 hover:text-rose-950 font-bold underline text-xs ml-3 whitespace-nowrap"
+          >
+            Export All Case Files
+          </button>
+        </div>
+      )}
+
+      {queryCaseId && (
+        <div className="p-4 rounded-xl bg-emerald-50 border border-emerald-300 text-emerald-950 text-xs flex items-center justify-between shadow-sm animate-in fade-in">
+          <div className="flex items-center gap-2.5">
+            <CheckCircle2 className="w-5 h-5 text-emerald-600 flex-shrink-0" />
+            <div>
+              <p className="font-bold text-sm text-emerald-900">Human Review Process Completed!</p>
+              <p className="text-[11px] text-emerald-800 mt-0.5">
+                All findings and exceptions for this batch have been confirmed or rejected. You can now generate official audit PDF packages, download CSV exports, or inspect the line-item dossier below.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Prominent Download Options Card */}
       <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-6 space-y-4">
@@ -300,10 +447,14 @@ export const ReportsExports: React.FC = () => {
               </span>
             </div>
             <span className="font-bold text-slate-900 text-xs mt-3 group-hover:text-rose-900">
-              {exporting === 'PDF' ? 'Generating PDF...' : 'Formal PDF Audit Report'}
+              {exporting === 'PDF'
+                ? 'Generating PDF...'
+                : (activeDoc && selectedDocId !== 'ALL' ? `PDF: ${activeDoc.original_filename}` : 'Formal PDF Audit Report')}
             </span>
             <span className="text-[11px] text-slate-500 mt-0.5 leading-relaxed">
-              Executive summary, evidence documents, line items, and itemized exceptions table
+              {activeDoc && selectedDocId !== 'ALL'
+                ? `Exports review decisions and evidence exclusively for ${activeDoc.original_filename}.`
+                : 'Executive summary, evidence documents, line items, and itemized exceptions table'}
             </span>
           </button>
 

@@ -47,6 +47,9 @@ export interface ReconciliationCase {
   finding_count: number;
   potential_leakage_amount: number;
   confirmed_leakage_amount: number;
+  potential_leakage_by_currency?: Record<string, number>;
+  confirmed_leakage_by_currency?: Record<string, number>;
+  currency_status?: 'NONE' | 'SINGLE' | 'MIXED' | 'REVIEW_REQUIRED';
 }
 
 export interface UploadedDocument {
@@ -115,6 +118,14 @@ export interface PipelineResultResponse {
   recognized_data?: Record<string, any>;
   findings_count: number;
   potential_leakage: number;
+  potential_leakage_by_currency?: Record<string, number>;
+  gross_overcharges?: number;
+  gross_overcharges_by_currency?: Record<string, number>;
+  potential_undercharges?: number;
+  potential_undercharges_by_currency?: Record<string, number>;
+  net_variance?: number;
+  net_variance_by_currency?: Record<string, number>;
+  currency_status?: 'NONE' | 'SINGLE' | 'MIXED' | 'REVIEW_REQUIRED';
   findings: PipelineResultFinding[];
   automated_steps: AutomatedStepItem[];
 }
@@ -131,6 +142,14 @@ export interface DocumentUploadResponse {
   reconciled?: boolean;
   findings_count?: number;
   potential_leakage?: number;
+  potential_leakage_by_currency?: Record<string, number>;
+  gross_overcharges?: number;
+  gross_overcharges_by_currency?: Record<string, number>;
+  potential_undercharges?: number;
+  potential_undercharges_by_currency?: Record<string, number>;
+  net_variance?: number;
+  net_variance_by_currency?: Record<string, number>;
+  currency_status?: 'NONE' | 'SINGLE' | 'MIXED' | 'REVIEW_REQUIRED';
   recognized_data?: Record<string, any>;
   findings?: PipelineResultFinding[];
   automated_steps?: AutomatedStepItem[];
@@ -206,6 +225,15 @@ export interface DashboardStats {
   total_documents?: number;
   potential_leakage: number;
   confirmed_leakage_amount?: number;
+  potential_leakage_by_currency?: Record<string, number>;
+  confirmed_leakage_by_currency?: Record<string, number>;
+  gross_overcharges?: number;
+  gross_overcharges_by_currency?: Record<string, number>;
+  potential_undercharges?: number;
+  potential_undercharges_by_currency?: Record<string, number>;
+  net_variance?: number;
+  net_variance_by_currency?: Record<string, number>;
+  currency_status?: 'NONE' | 'SINGLE' | 'MIXED' | 'REVIEW_REQUIRED';
   findings_awaiting_review: number;
   confirmed_findings: number;
   rejected_findings: number;
@@ -234,4 +262,3 @@ export interface ExportRecord {
   created_at: string;
   download_url?: string;
 }
-

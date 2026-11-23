@@ -24,7 +24,7 @@ class ReconciliationCase(Base, TimestampMixin):
 
     title = Column(String(255), nullable=False)
     case_reference = Column(String(100), nullable=False, unique=True)
-    currency = Column(String(10), default="GBP", nullable=False)
+    currency = Column(String(20), default="REVIEW_REQUIRED", nullable=False)
     status = Column(String(50), default=CaseStatus.DRAFT.value, nullable=False)
     date_from = Column(Date, nullable=True)
     date_to = Column(Date, nullable=True)
@@ -42,4 +42,3 @@ class ReconciliationCase(Base, TimestampMixin):
     invoices = relationship("Invoice", back_populates="case", cascade="all, delete-orphan")
     goods_received_notes = relationship("GoodsReceivedNote", back_populates="case", cascade="all, delete-orphan")
     exports = relationship("ExportRecord", back_populates="case", cascade="all, delete-orphan")
-

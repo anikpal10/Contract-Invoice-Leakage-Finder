@@ -1,6 +1,7 @@
 import os
 import csv
 import json
+import html
 from datetime import datetime
 from decimal import Decimal
 from typing import List, Tuple, Optional, Any
@@ -21,15 +22,7 @@ from backend.app.models.case import ReconciliationCase
 from backend.app.models.organization import Organization
 from backend.app.models.document import UploadedDocument
 from backend.app.models.extracted_entities import Invoice, Contract
-
-def get_currency_symbol(currency_code: Optional[str]) -> str:
-    mapping = {
-        "INR": "₹",
-        "GBP": "£",
-        "USD": "$",
-        "EUR": "€",
-    }
-    return mapping.get((currency_code or "").upper(), "£")
+from backend.app.services.financial_summary import get_currency_symbol
 
 class ReportGenerator:
     def __init__(self):
@@ -40,14 +33,19 @@ class ReportGenerator:
         self,
         case: ReconciliationCase,
         org: Organization,
-        findings: List[Finding]
+        findings: List[Finding],
+        target_document: Optional[UploadedDocument] = None
     ) -> Tuple[str, str, int, Decimal]:
         """
         Generates structured CSV report for reconciliation case findings.
         Returns: (filename, full_storage_path, record_count, total_leakage)
         """
         timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        filename = f"Reconciliation_{case.case_reference}_{timestamp}.csv"
+        if target_document and target_document.original_filename:
+            clean_name = os.path.splitext(target_document.original_filename)[0].replace(" ", "_")
+            filename = f"Reconciliation_{clean_name}_{timestamp}.csv"
+        else:
+            filename = f"Reconciliation_{case.case_reference}_{timestamp}.csv"
         filepath = os.path.join(self.export_dir, filename)
 
         headers = [
@@ -110,7 +108,8 @@ class ReportGenerator:
         findings: List[Finding],
         documents: Optional[List[UploadedDocument]] = None,
         invoices: Optional[List[Invoice]] = None,
-        contracts: Optional[List[Contract]] = None
+        contracts: Optional[List[Contract]] = None,
+        target_document: Optional[UploadedDocument] = None
     ) -> Tuple[str, str, int, Decimal]:
         """
         Generates a comprehensive landscape PDF report containing:
@@ -120,7 +119,11 @@ class ReportGenerator:
         - Detailed Findings & Review Decisions
         """
         timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        filename = f"Reconciliation_{case.case_reference}_{timestamp}.pdf"
+        if target_document and target_document.original_filename:
+            clean_name = os.path.splitext(target_document.original_filename)[0].replace(" ", "_")
+            filename = f"Reconciliation_{clean_name}_{timestamp}.pdf"
+        else:
+            filename = f"Reconciliation_{case.case_reference}_{timestamp}.pdf"
         filepath = os.path.join(self.export_dir, filename)
 
         doc = SimpleDocTemplate(
@@ -176,27 +179,44 @@ class ReportGenerator:
 
         elements = []
 
+        def esc(val: Any) -> str:
+            if val is None:
+                return ""
+            return html.escape(str(val))
+
         # Header Title
-        elements.append(Paragraph("<b>Contract & Invoice Reconciliation — Complete Audit Dossier</b>", title_style))
-        supplier_str = f" | Supplier: <b>{case.supplier.name}</b>" if case.supplier else ""
+        if target_document and target_document.original_filename:
+            elements.append(Paragraph(f"<b>Reconciliation Audit Report — {esc(target_document.original_filename)}</b>", title_style))
+            doc_context = f"File: <b>{esc(target_document.original_filename)}</b> | "
+        else:
+            elements.append(Paragraph("<b>Contract &amp; Invoice Reconciliation — Complete Audit Dossier</b>", title_style))
+            doc_context = ""
+
+        supplier_name = case.supplier.name if (case and case.supplier and case.supplier.name) else ""
+        supplier_str = f" | Supplier: <b>{esc(supplier_name)}</b>" if supplier_name else ""
+        org_name = org.name if (org and org.name) else "Organization"
+        case_ref = case.case_reference if (case and case.case_reference) else "CASE"
+        case_title = case.title if (case and case.title) else "Audit"
         elements.append(Paragraph(
-            f"Organization: <b>{org.name}</b> | Case: <b>{case.case_reference} — {case.title}</b>{supplier_str} | Generated: <b>{datetime.utcnow().strftime('%d %b %Y %H:%M UTC')}</b>",
+            f"{doc_context}Organization: <b>{esc(org_name)}</b> | Case: <b>{esc(case_ref)} — {esc(case_title)}</b>{supplier_str} | Generated: <b>{datetime.utcnow().strftime('%d %b %Y %H:%M UTC')}</b>",
             subtitle_style
         ))
         elements.append(Spacer(1, 0.15 * inch))
 
         # 1. Executive Summary & Metrics Table
-        total_potential = sum(f.potential_difference for f in findings)
-        confirmed_findings = [f for f in findings if f.review_status == ReviewStatus.CONFIRMED.value]
-        confirmed_leakage = sum(f.potential_difference for f in confirmed_findings)
-        pending_findings = [f for f in findings if f.review_status == ReviewStatus.NEW.value]
-        pending_leakage = sum(f.potential_difference for f in pending_findings)
-        rejected_count = sum(1 for f in findings if f.review_status == ReviewStatus.REJECTED.value)
+        total_potential = sum((f.potential_difference or Decimal("0.00")) for f in findings)
+        confirmed_findings = [f for f in findings if (f.review_status or "").upper() == ReviewStatus.CONFIRMED.value]
+        confirmed_leakage = sum((f.potential_difference or Decimal("0.00")) for f in confirmed_findings)
+        pending_findings = [f for f in findings if (f.review_status or "").upper() == ReviewStatus.NEW.value]
+        pending_leakage = sum((f.potential_difference or Decimal("0.00")) for f in pending_findings)
+        rejected_count = sum(1 for f in findings if (f.review_status or "").upper() == ReviewStatus.REJECTED.value)
+
+        total_doc_count = len(documents) if documents is not None else (len(case.documents) if (case and hasattr(case, 'documents') and case.documents) else 0)
 
         summary_data = [
             ["Total Documents", "Total Invoiced Leakage", "Confirmed Leakage (Reviewed)", "Pending Review Leakage", "Total Exceptions"],
             [
-                str(len(documents)) if documents else str(len(case.documents) if case.documents else 0),
+                str(total_doc_count),
                 f"{curr_sym}{total_potential:,.2f}",
                 f"{curr_sym}{confirmed_leakage:,.2f} ({len(confirmed_findings)} items)",
                 f"{curr_sym}{pending_leakage:,.2f} ({len(pending_findings)} items)",
@@ -220,7 +240,7 @@ class ReportGenerator:
         elements.append(Spacer(1, 0.15 * inch))
 
         # 2. Documents Inventory Section
-        docs_to_show = documents or (case.documents if hasattr(case, 'documents') else [])
+        docs_to_show = documents if documents is not None else (case.documents if (case and hasattr(case, 'documents') and case.documents) else [])
         if docs_to_show:
             elements.append(Paragraph("<b>1. Evidence Documents Analyzed</b>", section_style))
             elements.append(Spacer(1, 0.05 * inch))
@@ -234,12 +254,17 @@ class ReportGenerator:
             ]
             doc_rows = [doc_headers]
             for d in docs_to_show:
+                fname = d.original_filename or "Document"
+                cat_str = (d.category or "UNCATEGORIZED").replace('_', ' ')
+                size_str = f"{(d.file_size_bytes / 1024):.1f} KB" if (d.file_size_bytes is not None) else "N/A"
+                sha_str = f"{d.sha256_hash[:20]}..." if d.sha256_hash else "N/A"
+                proc_status = d.processing_status or "PROCESSED"
                 doc_rows.append([
-                    Paragraph(f"<b>{d.original_filename}</b>", cell_style),
-                    Paragraph(d.category.replace('_', ' '), cell_style),
-                    Paragraph(f"{(d.file_size_bytes / 1024):.1f} KB", cell_style),
-                    Paragraph(f"<font face='Courier'>{d.sha256_hash[:20]}...</font>", cell_style),
-                    Paragraph(f"<font color='green'><b>{d.processing_status}</b></font>", cell_style),
+                    Paragraph(f"<b>{esc(fname)}</b>", cell_style),
+                    Paragraph(esc(cat_str), cell_style),
+                    Paragraph(esc(size_str), cell_style),
+                    Paragraph(f"<font face='Courier'>{esc(sha_str)}</font>", cell_style),
+                    Paragraph(f"<font color='green'><b>{esc(proc_status)}</b></font>", cell_style),
                 ])
             doc_table = Table(doc_rows, colWidths=[3.2 * inch, 1.8 * inch, 1.2 * inch, 2.5 * inch, 1.5 * inch])
             doc_table.setStyle(TableStyle([
@@ -253,7 +278,7 @@ class ReportGenerator:
             elements.append(Spacer(1, 0.15 * inch))
 
         # 3. Itemized Findings Table
-        elements.append(Paragraph("<b>2. Reconciliation Leakage Findings & Exceptions</b>", section_style))
+        elements.append(Paragraph("<b>2. Reconciliation Leakage Findings &amp; Exceptions</b>", section_style))
         elements.append(Spacer(1, 0.05 * inch))
 
         table_headers = [
@@ -265,22 +290,35 @@ class ReportGenerator:
             Paragraph("Variance", header_style),
             Paragraph("Sev.", header_style),
             Paragraph("Review Status", header_style),
-            Paragraph("Evidence & Explanation", header_style),
+            Paragraph("Evidence &amp; Explanation", header_style),
         ]
         table_rows = [table_headers]
 
         for f in findings:
-            status_color = "#16a34a" if f.review_status == "CONFIRMED" else ("#dc2626" if f.review_status == "REJECTED" else "#d97706")
+            status_val = (f.review_status or "NEW").upper()
+            status_color = "#16a34a" if status_val == "CONFIRMED" else ("#dc2626" if status_val == "REJECTED" else "#d97706")
+            inv_ref = f.invoice_reference or "-"
+            line_str = f"Line: {f.line_number}" if f.line_number is not None else "Header"
+            cat_str = (f.finding_category or "EXCEPTION").replace('_', ' ')
+            desc_str = f.item_description or f.supplier_name or "Audit Item"
+            exp_amt = f.expected_amount if f.expected_amount is not None else Decimal("0.00")
+            inv_amt = f.invoiced_amount if f.invoiced_amount is not None else Decimal("0.00")
+            pot_diff = f.potential_difference if f.potential_difference is not None else Decimal("0.00")
+            sev_str = (f.severity or "MEDIUM")[:4]
+            calc_text = (f.calculation_explanation or "Audit reconciliation rule triggered.")[:200]
+            if len(f.calculation_explanation or "") > 200:
+                calc_text += "..."
+
             table_rows.append([
-                Paragraph(f"<b>{f.invoice_reference}</b><br/>Line: {f.line_number or '-'}", cell_style),
-                Paragraph(f.finding_category.replace('_', ' '), cell_style),
-                Paragraph(f.item_description or f.supplier_name, cell_style),
-                Paragraph(f"{curr_sym}{f.expected_amount:,.2f}", cell_style),
-                Paragraph(f"{curr_sym}{f.invoiced_amount:,.2f}", cell_style),
-                Paragraph(f"<b>{curr_sym}{f.potential_difference:,.2f}</b>", cell_style),
-                Paragraph(f.severity[:4], cell_style),
-                Paragraph(f"<font color='{status_color}'><b>{f.review_status}</b></font>", cell_style),
-                Paragraph(f.calculation_explanation[:200] + ("..." if len(f.calculation_explanation) > 200 else ""), cell_style),
+                Paragraph(f"<b>{esc(inv_ref)}</b><br/>{esc(line_str)}", cell_style),
+                Paragraph(esc(cat_str), cell_style),
+                Paragraph(esc(desc_str), cell_style),
+                Paragraph(f"{curr_sym}{exp_amt:,.2f}", cell_style),
+                Paragraph(f"{curr_sym}{inv_amt:,.2f}", cell_style),
+                Paragraph(f"<b>{curr_sym}{pot_diff:,.2f}</b>", cell_style),
+                Paragraph(esc(sev_str), cell_style),
+                Paragraph(f"<font color='{status_color}'><b>{esc(status_val)}</b></font>", cell_style),
+                Paragraph(esc(calc_text), cell_style),
             ])
 
         col_widths = [1.1 * inch, 1.4 * inch, 1.4 * inch, 0.9 * inch, 0.9 * inch, 1.0 * inch, 0.6 * inch, 1.0 * inch, 1.9 * inch]
@@ -306,7 +344,8 @@ class ReportGenerator:
         findings: List[Finding],
         documents: Optional[List[UploadedDocument]] = None,
         invoices: Optional[List[Invoice]] = None,
-        contracts: Optional[List[Contract]] = None
+        contracts: Optional[List[Contract]] = None,
+        target_document: Optional[UploadedDocument] = None
     ) -> Tuple[str, str, int, Decimal]:
         """
         Generates a comprehensive multi-sheet Excel workbook (.xlsx):
@@ -316,7 +355,11 @@ class ReportGenerator:
         - Sheet 4: Documents Analyzed
         """
         timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        filename = f"Reconciliation_{case.case_reference}_{timestamp}.xlsx"
+        if target_document and target_document.original_filename:
+            clean_name = os.path.splitext(target_document.original_filename)[0].replace(" ", "_")
+            filename = f"Reconciliation_{clean_name}_{timestamp}.xlsx"
+        else:
+            filename = f"Reconciliation_{case.case_reference}_{timestamp}.xlsx"
         filepath = os.path.join(self.export_dir, filename)
 
         wb = openpyxl.Workbook()
@@ -512,13 +555,18 @@ class ReportGenerator:
         findings: List[Finding],
         documents: Optional[List[UploadedDocument]] = None,
         invoices: Optional[List[Invoice]] = None,
-        contracts: Optional[List[Contract]] = None
+        contracts: Optional[List[Contract]] = None,
+        target_document: Optional[UploadedDocument] = None
     ) -> Tuple[str, str, int, Decimal]:
         """
         Generates full JSON audit dossier with all case data, documents, line items, and findings.
         """
         timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        filename = f"Reconciliation_{case.case_reference}_{timestamp}.json"
+        if target_document and target_document.original_filename:
+            clean_name = os.path.splitext(target_document.original_filename)[0].replace(" ", "_")
+            filename = f"Reconciliation_{clean_name}_{timestamp}.json"
+        else:
+            filename = f"Reconciliation_{case.case_reference}_{timestamp}.json"
         filepath = os.path.join(self.export_dir, filename)
 
         total_potential = sum((f.potential_difference for f in findings), Decimal("0.00"))
@@ -614,4 +662,3 @@ class ReportGenerator:
         return filename, filepath, len(findings), total_potential
 
 report_generator = ReportGenerator()
-

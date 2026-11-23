@@ -30,7 +30,7 @@ class Contract(Base, TimestampMixin):
     supplier_name = Column(String(255), nullable=False)
     effective_date = Column(Date, nullable=True)
     expiry_date = Column(Date, nullable=True)
-    currency = Column(String(10), default="GBP", nullable=False)
+    currency = Column(String(20), default="REVIEW_REQUIRED", nullable=False)
     payment_terms_days = Column(Integer, nullable=True)
     notes = Column(String(1000), nullable=True)
 
@@ -65,7 +65,7 @@ class PurchaseOrder(Base, TimestampMixin):
     po_number = Column(String(100), nullable=False)
     supplier_name = Column(String(255), nullable=False)
     order_date = Column(Date, nullable=True)
-    currency = Column(String(10), default="GBP", nullable=False)
+    currency = Column(String(20), default="REVIEW_REQUIRED", nullable=False)
     total_amount = Column(Numeric(18, 4), nullable=True)
 
     case = relationship("ReconciliationCase", back_populates="purchase_orders")
@@ -102,7 +102,7 @@ class Invoice(Base, TimestampMixin):
     due_date = Column(Date, nullable=True)
     po_reference = Column(String(100), nullable=True)
     contract_reference = Column(String(100), nullable=True)
-    currency = Column(String(10), default="GBP", nullable=False)
+    currency = Column(String(20), default="REVIEW_REQUIRED", nullable=False)
     subtotal = Column(Numeric(18, 4), nullable=False)
     tax_amount = Column(Numeric(18, 4), default=0, nullable=False)
     total_amount = Column(Numeric(18, 4), nullable=False)
@@ -161,4 +161,3 @@ class GRNLineItem(Base, TimestampMixin):
     confidence = Column(Numeric(5, 4), nullable=True)
 
     goods_received_note = relationship("GoodsReceivedNote", back_populates="line_items")
-

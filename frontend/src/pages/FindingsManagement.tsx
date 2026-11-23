@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { apiClient } from '../api/client';
 import { Finding, ReconciliationCase } from '../types';
+import { renderMoney } from '../utils/currency';
 import {
   AlertTriangle,
   Search,
@@ -188,28 +189,26 @@ export const FindingsManagement: React.FC = () => {
                       </span>
                     </td>
                     <td className="py-3 px-4 text-slate-600 truncate max-w-[150px]">{f.supplier_name}</td>
-                    <td className="py-3 px-4 text-right font-mono">£{Number(f.expected_amount).toFixed(2)}</td>
-                    <td className="py-3 px-4 text-right font-mono">£{Number(f.invoiced_amount).toFixed(2)}</td>
+                    <td className="py-3 px-4 text-right font-mono">{renderMoney(Number(f.expected_amount), f.currency)}</td>
+                    <td className="py-3 px-4 text-right font-mono">{renderMoney(Number(f.invoiced_amount), f.currency)}</td>
                     <td className="py-3 px-4 text-right font-mono font-bold text-rose-600">
-                      +£{Number(f.potential_difference).toFixed(2)}
+                      +{renderMoney(Number(f.potential_difference), f.currency)}
                     </td>
                     <td className="py-3 px-4">
-                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider ${
-                        f.severity === 'CRITICAL' ? 'bg-rose-100 text-rose-800' :
-                        f.severity === 'HIGH' ? 'bg-orange-100 text-orange-800' :
-                        f.severity === 'MEDIUM' ? 'bg-amber-100 text-amber-800' :
-                        'bg-slate-100 text-slate-700'
-                      }`}>
+                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider ${f.severity === 'CRITICAL' ? 'bg-rose-100 text-rose-800' :
+                          f.severity === 'HIGH' ? 'bg-orange-100 text-orange-800' :
+                            f.severity === 'MEDIUM' ? 'bg-amber-100 text-amber-800' :
+                              'bg-slate-100 text-slate-700'
+                        }`}>
                         {f.severity}
                       </span>
                     </td>
                     <td className="py-3 px-4">
-                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider ${
-                        f.review_status === 'CONFIRMED' ? 'bg-emerald-100 text-emerald-800' :
-                        f.review_status === 'REJECTED' ? 'bg-slate-200 text-slate-700' :
-                        f.review_status === 'NEEDS_MORE_INFO' ? 'bg-purple-100 text-purple-800' :
-                        'bg-sky-100 text-sky-800'
-                      }`}>
+                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider ${f.review_status === 'CONFIRMED' ? 'bg-emerald-100 text-emerald-800' :
+                          f.review_status === 'REJECTED' ? 'bg-slate-200 text-slate-700' :
+                            f.review_status === 'NEEDS_MORE_INFO' ? 'bg-purple-100 text-purple-800' :
+                              'bg-sky-100 text-sky-800'
+                        }`}>
                         {f.review_status.replace(/_/g, ' ')}
                       </span>
                     </td>
@@ -231,4 +230,3 @@ export const FindingsManagement: React.FC = () => {
     </div>
   );
 };
-

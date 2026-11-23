@@ -17,6 +17,15 @@ from backend.app.schemas.finding import FindingResponse
 from backend.app.services.reconciliation_engine import reconciliation_engine
 from backend.app.services.pandas_processor import pandas_processor
 from backend.app.services.audit import log_audit_event
+from backend.app.services.financial_summary import (
+    aggregate_amounts_by_currency,
+    single_currency_total,
+    currency_status,
+    is_eligible_overcharge,
+    is_eligible_undercharge,
+    undercharge_amount,
+    net_variance_by_currency,
+)
 
 router = APIRouter(prefix="/cases", tags=["Reconciliation Cases"])
 
@@ -44,15 +53,51 @@ def get_dashboard_summary(
         Finding.organization_id == org_id
     ).all()
 
-    # Only sum NEW (pending) findings for "Potential Leakage" KPI card
-    potential_leakage = sum(
-        (f.potential_difference for f in all_findings if f.review_status == ReviewStatus.NEW.value),
-        Decimal("0.00")
+    # Gross potential overcharge by currency (NEW only)
+    potential_leakage_by_currency = aggregate_amounts_by_currency(
+        all_findings,
+        "potential_difference",
+        status_attr="review_status",
+        status_equals=ReviewStatus.NEW.value,
+        predicate=is_eligible_overcharge,
     )
-    # Separately track confirmed leakage (reviewed & confirmed)
-    confirmed_leakage_amount = sum(
-        (f.potential_difference for f in all_findings if f.review_status == ReviewStatus.CONFIRMED.value),
-        Decimal("0.00")
+    potential_leakage = single_currency_total(potential_leakage_by_currency) or Decimal("0.00")
+
+    # Confirmed overcharge by currency
+    confirmed_leakage_by_currency = aggregate_amounts_by_currency(
+        all_findings,
+        "potential_difference",
+        status_attr="review_status",
+        status_equals=ReviewStatus.CONFIRMED.value,
+        predicate=is_eligible_overcharge,
+    )
+    confirmed_leakage_amount = single_currency_total(confirmed_leakage_by_currency) or Decimal("0.00")
+
+    # Potential undercharges (NEW only) - reported as positive magnitude per currency
+    potential_undercharges_by_currency = aggregate_amounts_by_currency(
+        all_findings,
+        "potential_difference",
+        status_attr="review_status",
+        status_equals=ReviewStatus.NEW.value,
+        predicate=is_eligible_undercharge,
+    )
+    # Convert stored negative variances to positive undercharge magnitudes
+    potential_undercharges_by_currency = {
+        c: abs(v) for c, v in potential_undercharges_by_currency.items()
+    }
+    potential_undercharges = single_currency_total(potential_undercharges_by_currency) or Decimal("0.00")
+
+    # Net variance = gross overcharges - potential undercharges (kept separate from gross)
+    net_variance_by_currency_map = net_variance_by_currency(
+        potential_leakage_by_currency,
+        potential_undercharges_by_currency,
+    )
+    net_variance = single_currency_total(net_variance_by_currency_map) or Decimal("0.00")
+
+    status_marker = currency_status(
+        potential_leakage_by_currency
+        or confirmed_leakage_by_currency
+        or potential_undercharges_by_currency
     )
     awaiting = sum(1 for f in all_findings if f.review_status == ReviewStatus.NEW.value)
     confirmed = sum(1 for f in all_findings if f.review_status == ReviewStatus.CONFIRMED.value)
@@ -64,6 +109,15 @@ def get_dashboard_summary(
         total_documents=total_documents,
         potential_leakage=potential_leakage,
         confirmed_leakage_amount=confirmed_leakage_amount,
+        potential_leakage_by_currency=potential_leakage_by_currency,
+        confirmed_leakage_by_currency=confirmed_leakage_by_currency,
+        gross_overcharges=potential_leakage,
+        gross_overcharges_by_currency=potential_leakage_by_currency,
+        potential_undercharges=potential_undercharges,
+        potential_undercharges_by_currency=potential_undercharges_by_currency,
+        net_variance=net_variance,
+        net_variance_by_currency=net_variance_by_currency_map,
+        currency_status=status_marker,
         findings_awaiting_review=awaiting,
         confirmed_findings=confirmed,
         rejected_findings=rejected
@@ -84,7 +138,7 @@ def create_case(
         supplier_id=request.supplier_id,
         title=request.title,
         case_reference=ref_code,
-        currency=request.currency or "GBP",
+        currency=(request.currency or "REVIEW_REQUIRED"),
         date_from=request.date_from,
         date_to=request.date_to,
         notes=request.notes,
@@ -157,13 +211,52 @@ def run_reconciliation(
 @router.get("/{case_id}/findings", response_model=List[FindingResponse])
 def get_case_findings(
     case_id: str,
+    document_id: Optional[str] = None,
+    review_status: Optional[str] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     case = verify_case_tenant(case_id, current_user, db)
-    findings = db.query(Finding).filter(
+    query = db.query(Finding).filter(
         Finding.case_id == case.id
-    ).order_by(Finding.potential_difference.desc()).all()
+    )
+    if review_status and review_status.upper() != "ALL":
+        query = query.filter(Finding.review_status == review_status.upper())
+
+    findings = query.order_by(Finding.potential_difference.desc()).all()
+
+    if document_id:
+        target_doc = None
+        if document_id.lower() == "latest":
+            target_doc = db.query(UploadedDocument).filter(
+                UploadedDocument.case_id == case.id
+            ).order_by(UploadedDocument.created_at.desc()).first()
+        else:
+            target_doc = db.query(UploadedDocument).filter(
+                UploadedDocument.id == document_id,
+                UploadedDocument.case_id == case.id
+            ).first()
+
+        if target_doc:
+            meta = target_doc.extracted_metadata or {}
+            inv_num = meta.get("invoice_number")
+            contract_ref = meta.get("contract_reference")
+            po_num = meta.get("po_number")
+
+            filtered = []
+            for f in findings:
+                refs = f.source_document_references or []
+                doc_ids = [r.get("document_id") for r in refs if isinstance(r, dict)]
+                if target_doc.id in doc_ids or (inv_num and f.invoice_reference == inv_num):
+                    filtered.append(f)
+                elif contract_ref and any(isinstance(r, dict) and (r.get("contract_reference") == contract_ref or r.get("document_id") == target_doc.id) for r in refs):
+                    filtered.append(f)
+                elif po_num and any(isinstance(r, dict) and (r.get("po_number") == po_num or r.get("document_id") == target_doc.id) for r in refs):
+                    filtered.append(f)
+            findings = filtered
+        else:
+            findings = []
+
     return findings
 
 @router.get("/{case_id}/analytics", response_model=CaseAnalyticsResponse)
@@ -187,8 +280,21 @@ def _build_case_response(c: ReconciliationCase, db: Session) -> CaseResponse:
     doc_count = db.query(UploadedDocument).filter(UploadedDocument.case_id == c.id).count()
     findings = db.query(Finding).filter(Finding.case_id == c.id).all()
     
-    potential_total = sum((f.potential_difference for f in findings), Decimal("0.00"))
-    confirmed_total = sum((f.potential_difference for f in findings if f.review_status == ReviewStatus.CONFIRMED.value), Decimal("0.00"))
+    potential_by_currency = aggregate_amounts_by_currency(
+        findings,
+        "potential_difference",
+        predicate=is_eligible_overcharge,
+    )
+    confirmed_by_currency = aggregate_amounts_by_currency(
+        findings,
+        "potential_difference",
+        status_attr="review_status",
+        status_equals=ReviewStatus.CONFIRMED.value,
+        predicate=is_eligible_overcharge,
+    )
+    potential_total = single_currency_total(potential_by_currency) or Decimal("0.00")
+    confirmed_total = single_currency_total(confirmed_by_currency) or Decimal("0.00")
+    status_marker = currency_status(potential_by_currency or confirmed_by_currency)
 
     supplier_name = c.supplier.name if c.supplier else None
 
@@ -210,6 +316,8 @@ def _build_case_response(c: ReconciliationCase, db: Session) -> CaseResponse:
         document_count=doc_count,
         finding_count=len(findings),
         potential_leakage_amount=potential_total,
-        confirmed_leakage_amount=confirmed_total
+        confirmed_leakage_amount=confirmed_total,
+        potential_leakage_by_currency=potential_by_currency,
+        confirmed_leakage_by_currency=confirmed_by_currency,
+        currency_status=status_marker,
     )
-

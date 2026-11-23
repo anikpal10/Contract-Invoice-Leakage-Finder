@@ -57,6 +57,7 @@ def favicon():
     return Response(status_code=204)
 
 @app.get("/health", tags=["System"])
+@app.get(f"{settings.API_V1_STR}/health", tags=["System"])
 def health_check():
     return {
         "status": "healthy",

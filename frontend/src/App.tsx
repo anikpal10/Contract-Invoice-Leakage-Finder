@@ -6,7 +6,6 @@ import { AppLayout } from './components/layout/AppLayout';
 import { Login } from './pages/Login';
 import { Register } from './pages/Register';
 import { Dashboard } from './pages/Dashboard';
-import { CreateCase } from './pages/CreateCase';
 import { DocumentUpload } from './pages/DocumentUpload';
 import { ProcessingStatus } from './pages/ProcessingStatus';
 import { ReconciliationResults } from './pages/ReconciliationResults';
@@ -54,7 +53,7 @@ export const App: React.FC = () => {
           <Route path="/dashboard" element={<ProtectedRoute><Dashboard /></ProtectedRoute>} />
           <Route path="/workspaces" element={<Navigate to="/dashboard" replace />} />
           <Route path="/suppliers" element={<Navigate to="/dashboard" replace />} />
-          <Route path="/cases/new" element={<ProtectedRoute><CreateCase /></ProtectedRoute>} />
+          <Route path="/cases/new" element={<Navigate to="/dashboard" replace />} />
           <Route path="/documents/upload" element={<ProtectedRoute><DocumentUpload /></ProtectedRoute>} />
           <Route path="/documents/status" element={<ProtectedRoute><ProcessingStatus /></ProtectedRoute>} />
           <Route path="/reconciliation" element={<ProtectedRoute><ReconciliationResults /></ProtectedRoute>} />

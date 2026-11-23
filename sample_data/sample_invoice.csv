@@ -1,0 +1,8 @@
+product_name,quantity,invoice_price,invoice_number,invoice_date,supplier_name
+Cloud Hosting Standard,10,150.00,INV-2026-901,2026-10-01,Apex Cloud Ltd
+Database Maintenance,20,90.00,INV-2026-902,2026-10-02,Apex Cloud Ltd
+Security Audit,1,1200.00,INV-2026-903,2026-10-03,Apex Cloud Ltd
+IT Support Hours,40,75.00,INV-2026-904,2026-10-04,Apex Cloud Ltd
+Data Backup Storage,50,20.00,INV-2026-905,2026-10-05,Apex Cloud Ltd
+Network Firewall Management,5,200.00,INV-2026-906,2026-10-06,Apex Cloud Ltd
+Uncontracted Expedited SLA,1,450.00,INV-2026-907,2026-10-07,Apex Cloud Ltd

@@ -53,5 +53,14 @@ class NormalizationService:
             return 0.0
         return fuzz.token_sort_ratio(s1, s2) / 100.0
 
+    @staticmethod
+    def calculate_token_set_similarity(s1: str, s2: str) -> float:
+        """
+        Returns similarity score between 0.0 and 1.0 using token set ratio (robust to subsets).
+        """
+        if not s1 or not s2:
+            return 0.0
+        return fuzz.token_set_ratio(s1, s2) / 100.0
+
 normalization_service = NormalizationService()
 

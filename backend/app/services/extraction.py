@@ -67,10 +67,25 @@ class ExtractionService:
             text_content, raw_tabular_rows, is_scanned = self._read_file(document.storage_path, document.file_type)
             
             extracted_data = None
-            extraction_method = "LOCAL_HEURISTIC_PARSER"
+            extraction_method = "LOCAL_HIGH_PRECISION_PARSER"
             
-            # 1. Try unified LLM extraction (Gemini / OpenAI) with Pydantic validation
-            if llm_service.is_available():
+            # Fast deterministic path for native text & structured tabular files (PDF/CSV/Excel)
+            # Yields instant extraction (< 10ms) without remote network stalls
+            if text_content and not is_scanned:
+                candidate_data = self._heuristic_parse(
+                    text=text_content,
+                    rows=raw_tabular_rows,
+                    category=document.category,
+                    filename=document.filename
+                )
+                has_items = bool(candidate_data.get("line_items"))
+                has_supplier = candidate_data.get("supplier_name") and candidate_data["supplier_name"] != "Unknown Supplier"
+                if has_items or has_supplier:
+                    extracted_data = candidate_data
+                    extraction_method = "LOCAL_HIGH_PRECISION_PARSER"
+
+            # If fast path didn't yield structured items or document is scanned image, invoke AI LLM
+            if not extracted_data and llm_service.is_available():
                 pydantic_result: Optional[ExtractedDocumentData] = None
                 
                 # If scanned PDF and Gemini client is available, use multimodal vision OCR
@@ -91,17 +106,7 @@ class ExtractionService:
                     extracted_data = self._convert_pydantic_to_extracted_dict(pydantic_result, document.category)
                     extraction_method = llm_service.get_active_provider_name()
 
-            # 2. Legacy Gemini fallback if llm_service was not active
-            if not extracted_data and gemini_extractor.is_gemini_active() and text_content:
-                extracted_data = gemini_extractor.extract_document_with_gemini(
-                    document_text=text_content,
-                    category=document.category,
-                    filename=document.filename
-                )
-                if extracted_data:
-                    extraction_method = "GEMINI_API"
-
-            # 3. Fall back to robust deterministic local heuristic/tabular parser
+            # Fall back to heuristic parse if needed
             if not extracted_data:
                 extracted_data = self._heuristic_parse(
                     text=text_content,
@@ -151,7 +156,7 @@ class ExtractionService:
                 "contracted_unit_price": float(item.unit_price),
                 "tax_amount": float(item.tax_amount or 0),
                 "discount": float(item.discount or 0),
-                "currency": item.currency or data.currency or "GBP",
+                "currency": item.currency or data.currency or "REVIEW_REQUIRED",
                 "source_page_or_row": f"Page {item.source_page_number or 1}",
                 "confidence": float(item.confidence_score or data.confidence_score or 0.95),
             }
@@ -159,7 +164,7 @@ class ExtractionService:
 
         result: Dict[str, Any] = {
             "supplier_name": data.supplier_name or "Unknown Supplier",
-            "currency": data.currency or "GBP",
+            "currency": data.currency or "REVIEW_REQUIRED",
             "confidence": float(data.confidence_score or 0.95),
             "line_items": line_items,
             "payment_terms": data.payment_terms,
@@ -321,7 +326,7 @@ class ExtractionService:
         currency = search_pattern([
             r"Currency\s*[:\s-]\s*([A-Za-z]{3})",
             r"\b(INR|GBP|EUR|USD|AUD|CAD)\b"
-        ], default="GBP").upper()
+        ], default="REVIEW_REQUIRED").upper()
 
         if category == DocumentCategory.INVOICE.value:
             inv_num = search_pattern([
@@ -412,9 +417,11 @@ class ExtractionService:
 
         elif category in (DocumentCategory.CONTRACT.value, DocumentCategory.PRICE_SCHEDULE.value):
             contract_ref = search_pattern([
-                r"Contract\s*(?:Number|No\.?|Ref|#)\s*[:\s-]\s*([A-Za-z0-9-_]+)",
-                r"Agreement\s*#?\s*[:\s-]\s*([A-Za-z0-9-_]+)",
+                r"Contract\s*(?:Number|No\.?|Ref|Reference|#|:)\s*[:\s-]*([A-Za-z0-9-_]+)",
+                r"Agreement\s*#?\s*[:\s-]*([A-Za-z0-9-_]+)",
+                r"\b([A-Za-z0-9-_]+-CON-[A-Za-z0-9-_]+)\b",
                 r"\b(CON-[A-Za-z0-9-_]+)\b",
+                r"\b([A-Za-z0-9-_]+-CTR-[A-Za-z0-9-_]+)\b",
                 r"\b(CTR-[A-Za-z0-9-_]+)\b"
             ], default=f"CTR-{abs(hash(filename)) % 100000}")
 
@@ -623,14 +630,38 @@ class ExtractionService:
                 db.add(field)
 
         if category == DocumentCategory.INVOICE.value:
-            # Clean up existing invoice for this document or case+number to guarantee exactly 1 invoice
+            # Clean up existing invoice strictly for this document ID to ensure 1-to-1 provenance
             existing_invs = db.query(Invoice).filter(
-                (Invoice.document_id == document.id) |
-                ((Invoice.case_id == case_id) & (Invoice.invoice_number == data.get("invoice_number")))
+                Invoice.document_id == document.id
             ).all()
             for old_inv in existing_invs:
                 db.delete(old_inv)
             db.flush()
+
+            # Requirements 3 & 4: Never treat missing subtotal as zero; calculate from validated line items
+            line_items_data = data.get("line_items", [])
+            line_sum = sum(safe_decimal(item.get("line_total", 0)) for item in line_items_data) if line_items_data else Decimal("0.00")
+            subtotal_raw = data.get("subtotal")
+
+            if subtotal_raw is not None and safe_decimal(subtotal_raw) > Decimal("0.00"):
+                inv_subtotal = safe_decimal(subtotal_raw)
+            elif line_sum > Decimal("0.00"):
+                inv_subtotal = line_sum
+            else:
+                inv_subtotal = safe_decimal(subtotal_raw, default=Decimal("0.00"))
+
+            tax_amt = safe_decimal(data.get("tax_amount", 0))
+            total_raw = data.get("total_amount")
+            if total_raw is not None and safe_decimal(total_raw) > Decimal("0.00"):
+                inv_total = safe_decimal(total_raw)
+            elif inv_subtotal > Decimal("0.00"):
+                inv_total = inv_subtotal + tax_amt
+            else:
+                inv_total = safe_decimal(total_raw, default=Decimal("0.00"))
+
+            # Update data dictionary so extracted_metadata matches validated basis
+            data["subtotal"] = float(inv_subtotal)
+            data["total_amount"] = float(inv_total)
 
             inv = Invoice(
                 case_id=case_id,
@@ -641,10 +672,10 @@ class ExtractionService:
                 due_date=safe_date(data.get("due_date")),
                 po_reference=data.get("po_reference"),
                 contract_reference=data.get("contract_reference"),
-                currency=data.get("currency", "GBP"),
-                subtotal=safe_decimal(data.get("subtotal")),
-                tax_amount=safe_decimal(data.get("tax_amount")),
-                total_amount=safe_decimal(data.get("total_amount")),
+                currency=data.get("currency", "REVIEW_REQUIRED"),
+                subtotal=inv_subtotal,
+                tax_amount=tax_amt,
+                total_amount=inv_total,
                 is_credit_note=data.get("is_credit_note", False)
             )
             db.add(inv)
@@ -666,10 +697,9 @@ class ExtractionService:
                 db.add(li)
 
         elif category == DocumentCategory.PURCHASE_ORDER.value:
-            # Clean up existing purchase order for this document or case+number
+            # Clean up existing purchase order strictly for this document ID
             existing_pos = db.query(PurchaseOrder).filter(
-                (PurchaseOrder.document_id == document.id) |
-                ((PurchaseOrder.case_id == case_id) & (PurchaseOrder.po_number == data.get("po_number")))
+                PurchaseOrder.document_id == document.id
             ).all()
             for old_po in existing_pos:
                 db.delete(old_po)
@@ -681,7 +711,7 @@ class ExtractionService:
                 po_number=data.get("po_number", f"PO-{document.id[:8]}"),
                 supplier_name=data.get("supplier_name", "Unknown Supplier"),
                 order_date=safe_date(data.get("order_date")),
-                currency=data.get("currency", "GBP"),
+                currency=data.get("currency", "REVIEW_REQUIRED"),
                 total_amount=safe_decimal(data.get("total_amount"))
             )
             db.add(po)
@@ -702,10 +732,9 @@ class ExtractionService:
                 db.add(poli)
 
         elif category in (DocumentCategory.CONTRACT.value, DocumentCategory.PRICE_SCHEDULE.value):
-            # Clean up existing contract for this document or case+reference
+            # Clean up existing contract strictly for this document ID
             existing_contracts = db.query(Contract).filter(
-                (Contract.document_id == document.id) |
-                ((Contract.case_id == case_id) & (Contract.contract_reference == data.get("contract_reference")))
+                Contract.document_id == document.id
             ).all()
             for old_c in existing_contracts:
                 db.delete(old_c)
@@ -718,7 +747,7 @@ class ExtractionService:
                 supplier_name=data.get("supplier_name", "Unknown Supplier"),
                 effective_date=safe_date(data.get("effective_date")),
                 expiry_date=safe_date(data.get("expiry_date")),
-                currency=data.get("currency", "GBP")
+                currency=data.get("currency", "REVIEW_REQUIRED")
             )
             db.add(contract)
             db.flush()
@@ -738,10 +767,9 @@ class ExtractionService:
                 db.add(cli)
 
         elif category == DocumentCategory.GOODS_RECEIVED_NOTE.value:
-            # Clean up existing GRN for this document or case+number
+            # Clean up existing GRN strictly for this document ID
             existing_grns = db.query(GoodsReceivedNote).filter(
-                (GoodsReceivedNote.document_id == document.id) |
-                ((GoodsReceivedNote.case_id == case_id) & (GoodsReceivedNote.grn_number == data.get("grn_number")))
+                GoodsReceivedNote.document_id == document.id
             ).all()
             for old_grn in existing_grns:
                 db.delete(old_grn)

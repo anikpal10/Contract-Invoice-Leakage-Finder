@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import { apiClient } from '../api/client';
 import { Finding } from '../types';
+import { getCurrencySymbol, renderMoney } from '../utils/currency';
 import {
   ArrowLeft,
   CheckCircle2,
@@ -23,6 +24,7 @@ export const FindingDetails: React.FC = () => {
   const [adjustedAmount, setAdjustedAmount] = useState<string>('');
   const [submitting, setSubmitting] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [redirectNotice, setRedirectNotice] = useState<string | null>(null);
   const navigate = useNavigate();
 
   useEffect(() => {
@@ -53,6 +55,22 @@ export const FindingDetails: React.FC = () => {
       });
       setFinding(res.data);
       setComment('');
+
+      // Check if this case has any remaining unreviewed findings
+      try {
+        const caseFindingsRes = await apiClient.get(`/cases/${finding.case_id}/findings`);
+        const stillPending = caseFindingsRes.data.filter(
+          (f: any) => (f.review_status === 'NEW' || f.review_status === 'UNDER_REVIEW') && f.id !== finding.id
+        );
+        if (stillPending.length === 0) {
+          setRedirectNotice('Human review completed for this case! All findings evaluated — automatically routing to Reports & Exports...');
+          setTimeout(() => {
+            navigate(`/reports?caseId=${finding.case_id}`);
+          }, 1100);
+        }
+      } catch (e) {
+        console.error('Failed to check remaining findings:', e);
+      }
     } catch (err) {
       console.error('Failed to submit review decision:', err);
     } finally {
@@ -98,6 +116,13 @@ export const FindingDetails: React.FC = () => {
         </div>
       </div>
 
+      {redirectNotice && (
+        <div className="p-4 rounded-xl bg-emerald-50 border border-emerald-300 text-emerald-900 text-xs flex items-center gap-2.5 animate-in fade-in shadow-sm">
+          <CheckCircle2 className="w-5 h-5 text-emerald-600 animate-pulse flex-shrink-0" />
+          <span className="font-bold">{redirectNotice}</span>
+        </div>
+      )}
+
       {/* Main Finding Overview Card */}
       <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-6 md:p-8 space-y-6">
         <div>
@@ -118,21 +143,21 @@ export const FindingDetails: React.FC = () => {
           <div>
             <div className="text-xs text-slate-500 font-medium uppercase tracking-wider">Contracted / Expected</div>
             <div className="mt-1 text-2xl font-bold text-slate-800">
-              £{Number(finding.expected_amount).toFixed(2)}
+              {renderMoney(Number(finding.expected_amount), finding.currency)}
             </div>
             <div className="text-[11px] text-slate-500 mt-0.5">Authorised by PO / Contract</div>
           </div>
           <div>
             <div className="text-xs text-slate-500 font-medium uppercase tracking-wider">Invoiced Charge</div>
             <div className="mt-1 text-2xl font-bold text-slate-900">
-              £{Number(finding.invoiced_amount).toFixed(2)}
+              {renderMoney(Number(finding.invoiced_amount), finding.currency)}
             </div>
             <div className="text-[11px] text-slate-500 mt-0.5">Stated on supplier invoice</div>
           </div>
           <div className="border-t md:border-t-0 md:border-l border-slate-200 pt-3 md:pt-0">
             <div className="text-xs text-rose-600 font-bold uppercase tracking-wider">Potential Difference</div>
             <div className="mt-1 text-2xl font-bold text-rose-600">
-              +£{Number(finding.potential_difference).toFixed(2)}
+              +{renderMoney(Number(finding.potential_difference), finding.currency)}
             </div>
             <div className="text-[11px] text-rose-600 mt-0.5 font-medium">Candidate leakage exposure</div>
           </div>
@@ -216,7 +241,7 @@ export const FindingDetails: React.FC = () => {
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div>
-              <label className="block text-[11px] text-slate-400 mb-1">Adjusted Potential Amount (£)</label>
+                <label className="block text-[11px] text-slate-400 mb-1">Adjusted Potential Amount ({getCurrencySymbol(finding.currency)})</label>
               <input
                 type="number"
                 step="0.01"
@@ -268,4 +293,3 @@ export const FindingDetails: React.FC = () => {
     </div>
   );
 };
-

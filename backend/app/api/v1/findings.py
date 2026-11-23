@@ -6,6 +6,7 @@ from backend.app.core.database import get_db
 from backend.app.core.dependencies import get_current_user, require_role
 from backend.app.models.user import User, UserRole
 from backend.app.models.finding import Finding, ReviewDecision, ReviewStatus
+from backend.app.models.document import UploadedDocument
 from backend.app.schemas.finding import FindingResponse, FindingPatchRequest, FindingReviewAction, ReviewDecisionResponse
 from backend.app.services.audit import log_audit_event
 
@@ -14,6 +15,7 @@ router = APIRouter(prefix="/findings", tags=["Findings Management & Human Review
 @router.get("/", response_model=List[FindingResponse])
 def list_findings(
     case_id: Optional[str] = None,
+    document_id: Optional[str] = None,
     review_status: Optional[str] = None,
     severity: Optional[str] = None,
     limit: int = 200,
@@ -29,6 +31,42 @@ def list_findings(
         query = query.filter(Finding.severity == severity.upper())
 
     findings = query.order_by(Finding.potential_difference.desc()).limit(limit).all()
+
+    if document_id:
+        target_doc = None
+        if document_id.lower() == "latest":
+            doc_query = db.query(UploadedDocument).filter(
+                UploadedDocument.organization_id == current_user.organization_id
+            )
+            if case_id:
+                doc_query = doc_query.filter(UploadedDocument.case_id == case_id)
+            target_doc = doc_query.order_by(UploadedDocument.created_at.desc()).first()
+        else:
+            target_doc = db.query(UploadedDocument).filter(
+                UploadedDocument.id == document_id,
+                UploadedDocument.organization_id == current_user.organization_id
+            ).first()
+
+        if target_doc:
+            meta = target_doc.extracted_metadata or {}
+            inv_num = meta.get("invoice_number")
+            contract_ref = meta.get("contract_reference")
+            po_num = meta.get("po_number")
+
+            filtered = []
+            for f in findings:
+                refs = f.source_document_references or []
+                doc_ids = [r.get("document_id") for r in refs if isinstance(r, dict)]
+                if target_doc.id in doc_ids or (inv_num and f.invoice_reference == inv_num):
+                    filtered.append(f)
+                elif contract_ref and any(isinstance(r, dict) and (r.get("contract_reference") == contract_ref or r.get("document_id") == target_doc.id) for r in refs):
+                    filtered.append(f)
+                elif po_num and any(isinstance(r, dict) and (r.get("po_number") == po_num or r.get("document_id") == target_doc.id) for r in refs):
+                    filtered.append(f)
+            findings = filtered
+        else:
+            findings = []
+
     return [_build_finding_response(f) for f in findings]
 
 @router.get("/{finding_id}", response_model=FindingResponse)

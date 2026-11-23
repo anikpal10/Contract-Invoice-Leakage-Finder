@@ -69,6 +69,14 @@ class PipelineResultResponse(BaseModel):
     recognized_data: Optional[Dict[str, Any]] = None
     findings_count: int
     potential_leakage: Decimal
+    potential_leakage_by_currency: Optional[Dict[str, Decimal]] = {}
+    gross_overcharges: Optional[Decimal] = Decimal("0.00")
+    gross_overcharges_by_currency: Optional[Dict[str, Decimal]] = {}
+    potential_undercharges: Optional[Decimal] = Decimal("0.00")
+    potential_undercharges_by_currency: Optional[Dict[str, Decimal]] = {}
+    net_variance: Optional[Decimal] = Decimal("0.00")
+    net_variance_by_currency: Optional[Dict[str, Decimal]] = {}
+    currency_status: Optional[str] = "NONE"
     findings: List[PipelineResultFinding] = []
     automated_steps: List[AutomatedStepItem] = []
 
@@ -84,6 +92,14 @@ class DocumentUploadResponse(BaseModel):
     reconciled: Optional[bool] = False
     findings_count: Optional[int] = 0
     potential_leakage: Optional[Decimal] = Decimal("0.00")
+    potential_leakage_by_currency: Optional[Dict[str, Decimal]] = {}
+    gross_overcharges: Optional[Decimal] = Decimal("0.00")
+    gross_overcharges_by_currency: Optional[Dict[str, Decimal]] = {}
+    potential_undercharges: Optional[Decimal] = Decimal("0.00")
+    potential_undercharges_by_currency: Optional[Dict[str, Decimal]] = {}
+    net_variance: Optional[Decimal] = Decimal("0.00")
+    net_variance_by_currency: Optional[Dict[str, Decimal]] = {}
+    currency_status: Optional[str] = "NONE"
     recognized_data: Optional[Dict[str, Any]] = None
     findings: Optional[List[PipelineResultFinding]] = []
     automated_steps: Optional[List[AutomatedStepItem]] = []
@@ -111,5 +127,4 @@ class DirectBatchIngestResponse(BaseModel):
     skipped_duplicates: int
     errors: int
     results: List[DirectBatchIngestItem]
-
 

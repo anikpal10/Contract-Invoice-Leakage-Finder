@@ -15,6 +15,12 @@ from backend.app.models.extracted_entities import Invoice, Contract
 from backend.app.schemas.export import ExportRequest, ExportRecordResponse
 from backend.app.services.report_generator import report_generator
 from backend.app.services.audit import log_audit_event
+from backend.app.services.financial_summary import (
+    aggregate_amounts_by_currency,
+    currency_status,
+    single_currency_total,
+    is_eligible_overcharge,
+)
 
 router = APIRouter(prefix="/cases", tags=["Reports & Exports"])
 
@@ -47,6 +53,7 @@ def list_case_exports(
 @router.get("/{case_id}/full-dossier")
 def get_case_full_dossier(
     case_id: str,
+    document_id: Optional[str] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -59,14 +66,76 @@ def get_case_full_dossier(
     invoices = db.query(Invoice).filter(Invoice.case_id == case.id).all()
     contracts = db.query(Contract).filter(Contract.case_id == case.id).all()
 
-    total_potential = sum((f.potential_difference for f in findings), Decimal("0.00"))
+    target_doc = None
+    if document_id:
+        if document_id.lower() == "latest":
+            target_doc = documents[0] if documents else None
+        else:
+            target_doc = next((d for d in documents if d.id == document_id), None)
+
+    if target_doc:
+        meta = target_doc.extracted_metadata or {}
+        inv_num = meta.get("invoice_number")
+        contract_ref = meta.get("contract_reference")
+        po_num = meta.get("po_number")
+
+        filtered_findings = []
+        for f in findings:
+            refs = f.source_document_references or []
+            doc_ids = [r.get("document_id") for r in refs if isinstance(r, dict)]
+            if target_doc.id in doc_ids or (inv_num and f.invoice_reference == inv_num):
+                filtered_findings.append(f)
+            elif contract_ref and any(isinstance(r, dict) and (r.get("contract_reference") == contract_ref or r.get("document_id") == target_doc.id) for r in refs):
+                filtered_findings.append(f)
+            elif po_num and any(isinstance(r, dict) and (r.get("po_number") == po_num or r.get("document_id") == target_doc.id) for r in refs):
+                filtered_findings.append(f)
+        findings = filtered_findings
+
+        related_doc_ids = {target_doc.id}
+        for f in findings:
+            for r in (f.source_document_references or []):
+                if isinstance(r, dict) and r.get("document_id"):
+                    related_doc_ids.add(r.get("document_id"))
+        documents = [d for d in documents if d.id in related_doc_ids]
+
+        if inv_num:
+            invoices = [inv for inv in invoices if inv.invoice_number == inv_num or inv.document_id == target_doc.id]
+        elif target_doc.id:
+            invoices = [inv for inv in invoices if inv.document_id in related_doc_ids]
+
+        if contract_ref:
+            contracts = [c for c in contracts if c.contract_reference == contract_ref or c.document_id == target_doc.id]
+        elif target_doc.id:
+            contracts = [c for c in contracts if c.document_id in related_doc_ids]
+
+    total_by_currency = aggregate_amounts_by_currency(
+        findings,
+        "potential_difference",
+        predicate=is_eligible_overcharge,
+    )
+    total_potential = single_currency_total(total_by_currency) or Decimal("0.00")
     confirmed_findings = [f for f in findings if f.review_status == ReviewStatus.CONFIRMED.value]
-    confirmed_leakage = sum((f.potential_difference for f in confirmed_findings), Decimal("0.00"))
+    confirmed_by_currency = aggregate_amounts_by_currency(
+        findings,
+        "potential_difference",
+        status_attr="review_status",
+        status_equals=ReviewStatus.CONFIRMED.value,
+        predicate=is_eligible_overcharge,
+    )
+    confirmed_leakage = single_currency_total(confirmed_by_currency) or Decimal("0.00")
     pending_findings = [f for f in findings if f.review_status == ReviewStatus.NEW.value]
-    pending_leakage = sum((f.potential_difference for f in pending_findings), Decimal("0.00"))
+    pending_by_currency = aggregate_amounts_by_currency(
+        findings,
+        "potential_difference",
+        status_attr="review_status",
+        status_equals=ReviewStatus.NEW.value,
+        predicate=is_eligible_overcharge,
+    )
+    pending_leakage = single_currency_total(pending_by_currency) or Decimal("0.00")
     rejected_findings = [f for f in findings if f.review_status == ReviewStatus.REJECTED.value]
 
-    currency = findings[0].currency if findings else (case.currency or "GBP")
+    currency = next(iter(total_by_currency.keys()), case.currency or "REVIEW_REQUIRED")
+    status_marker = currency_status(total_by_currency or pending_by_currency or confirmed_by_currency)
 
     # Format extracted line items
     all_lines = []
@@ -99,6 +168,10 @@ def get_case_full_dossier(
             "total_potential_leakage": float(total_potential),
             "confirmed_leakage": float(confirmed_leakage),
             "pending_leakage": float(pending_leakage),
+            "total_potential_leakage_by_currency": {k: float(v) for k, v in total_by_currency.items()},
+            "confirmed_leakage_by_currency": {k: float(v) for k, v in confirmed_by_currency.items()},
+            "pending_leakage_by_currency": {k: float(v) for k, v in pending_by_currency.items()},
+            "currency_status": status_marker,
             "confirmed_count": len(confirmed_findings),
             "pending_count": len(pending_findings),
             "rejected_count": len(rejected_findings),
@@ -159,21 +232,68 @@ def generate_export_report(
     invoices = db.query(Invoice).filter(Invoice.case_id == case.id).all()
     contracts = db.query(Contract).filter(Contract.case_id == case.id).all()
 
+    target_doc = None
+    if request.document_id:
+        if request.document_id.lower() == "latest":
+            target_doc = db.query(UploadedDocument).filter(
+                UploadedDocument.case_id == case.id
+            ).order_by(UploadedDocument.created_at.desc()).first()
+        else:
+            target_doc = db.query(UploadedDocument).filter(
+                UploadedDocument.id == request.document_id,
+                UploadedDocument.case_id == case.id
+            ).first()
+
+    if target_doc:
+        meta = target_doc.extracted_metadata or {}
+        inv_num = meta.get("invoice_number")
+        contract_ref = meta.get("contract_reference")
+        po_num = meta.get("po_number")
+
+        filtered_findings = []
+        for f in findings:
+            refs = f.source_document_references or []
+            doc_ids = [r.get("document_id") for r in refs if isinstance(r, dict)]
+            if target_doc.id in doc_ids or (inv_num and f.invoice_reference == inv_num):
+                filtered_findings.append(f)
+            elif contract_ref and any(isinstance(r, dict) and (r.get("contract_reference") == contract_ref or r.get("document_id") == target_doc.id) for r in refs):
+                filtered_findings.append(f)
+            elif po_num and any(isinstance(r, dict) and (r.get("po_number") == po_num or r.get("document_id") == target_doc.id) for r in refs):
+                filtered_findings.append(f)
+        findings = filtered_findings
+
+        related_doc_ids = {target_doc.id}
+        for f in findings:
+            for r in (f.source_document_references or []):
+                if isinstance(r, dict) and r.get("document_id"):
+                    related_doc_ids.add(r.get("document_id"))
+        documents = [d for d in documents if d.id in related_doc_ids]
+
+        if inv_num:
+            invoices = [inv for inv in invoices if inv.invoice_number == inv_num or inv.document_id == target_doc.id]
+        elif target_doc.id:
+            invoices = [inv for inv in invoices if inv.document_id in related_doc_ids]
+
+        if contract_ref:
+            contracts = [c for c in contracts if c.contract_reference == contract_ref or c.document_id == target_doc.id]
+        elif target_doc.id:
+            contracts = [c for c in contracts if c.document_id in related_doc_ids]
+
     fmt = request.format.upper()
     if fmt == "CSV":
-        filename, filepath, count, total = report_generator.generate_csv_report(case, org, findings)
+        filename, filepath, count, total = report_generator.generate_csv_report(case, org, findings, target_document=target_doc)
     elif fmt == "PDF":
         filename, filepath, count, total = report_generator.generate_pdf_report(
-            case, org, findings, documents=documents, invoices=invoices, contracts=contracts
+            case, org, findings, documents=documents, invoices=invoices, contracts=contracts, target_document=target_doc
         )
     elif fmt in ["EXCEL", "XLSX"]:
         filename, filepath, count, total = report_generator.generate_excel_report(
-            case, org, findings, documents=documents, invoices=invoices, contracts=contracts
+            case, org, findings, documents=documents, invoices=invoices, contracts=contracts, target_document=target_doc
         )
         fmt = "EXCEL"
     elif fmt == "JSON":
         filename, filepath, count, total = report_generator.generate_json_dossier(
-            case, org, findings, documents=documents, invoices=invoices, contracts=contracts
+            case, org, findings, documents=documents, invoices=invoices, contracts=contracts, target_document=target_doc
         )
     else:
         raise HTTPException(status_code=400, detail="Invalid format. Supported formats: 'PDF', 'EXCEL', 'CSV', 'JSON'")
@@ -221,13 +341,45 @@ def download_export_file(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    verify_case_tenant(case_id, current_user, db)
+    case = verify_case_tenant(case_id, current_user, db)
     record = db.query(ExportRecord).filter(
         ExportRecord.id == export_id,
         ExportRecord.organization_id == current_user.organization_id
     ).first()
-    if not record or not os.path.exists(record.storage_path):
-        raise HTTPException(status_code=404, detail="Export file not found")
+    if not record:
+        raise HTTPException(status_code=404, detail="Export record not found")
+
+    if not record.storage_path or not os.path.exists(record.storage_path):
+        # Dynamically regenerate the missing export file on the fly
+        org = case.organization
+        findings = db.query(Finding).filter(Finding.case_id == case.id).all()
+        documents = db.query(UploadedDocument).filter(UploadedDocument.case_id == case.id).all()
+        invoices = db.query(Invoice).filter(Invoice.case_id == case.id).all()
+        contracts = db.query(Contract).filter(Contract.case_id == case.id).all()
+
+        fmt = record.format.upper()
+        if fmt == "CSV":
+            filename, filepath, count, total = report_generator.generate_csv_report(case, org, findings)
+        elif fmt == "PDF":
+            filename, filepath, count, total = report_generator.generate_pdf_report(
+                case, org, findings, documents=documents, invoices=invoices, contracts=contracts
+            )
+        elif fmt in ["EXCEL", "XLSX"]:
+            filename, filepath, count, total = report_generator.generate_excel_report(
+                case, org, findings, documents=documents, invoices=invoices, contracts=contracts
+            )
+        elif fmt == "JSON":
+            filename, filepath, count, total = report_generator.generate_json_dossier(
+                case, org, findings, documents=documents, invoices=invoices, contracts=contracts
+            )
+        else:
+            raise HTTPException(status_code=404, detail="Export file not found and format unsupported")
+
+        record.storage_path = filepath
+        record.file_name = filename
+        record.record_count = count
+        record.total_leakage_amount = total
+        db.commit()
 
     media_types = {
         "PDF": "application/pdf",
@@ -242,7 +394,10 @@ def download_export_file(
         path=record.storage_path,
         media_type=media_type,
         filename=record.file_name,
-        headers={"Content-Disposition": f'attachment; filename="{record.file_name}"'}
+        headers={
+            "Content-Disposition": f'attachment; filename="{record.file_name}"',
+            "Access-Control-Expose-Headers": "Content-Disposition"
+        }
     )
 
 @router.delete("/{case_id}/exports/{export_id}")
@@ -293,4 +448,3 @@ def clear_all_exports(
 
     db.commit()
     return {"message": f"Cleared {count} export(s).", "cleared_count": count}
-

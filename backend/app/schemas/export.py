@@ -6,6 +6,7 @@ from decimal import Decimal
 class ExportRequest(BaseModel):
     format: str  # "CSV" or "PDF"
     include_rejected: bool = False
+    document_id: Optional[str] = None
 
 class ExportRecordResponse(BaseModel):
     id: str
@@ -16,6 +17,7 @@ class ExportRecordResponse(BaseModel):
     total_leakage_amount: Decimal
     created_at: datetime
     download_url: Optional[str] = None
+    document_id: Optional[str] = None
 
     class Config:
         from_attributes = True

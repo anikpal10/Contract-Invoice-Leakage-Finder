@@ -19,8 +19,8 @@ def test_direct_file_path_ingest_zero_memory(client, test_tenants, db_session):
     db_session.commit()
     db_session.refresh(case)
 
-    # Test single file path using synthetic dataset invoice
-    sample_file = "synthetic_dataset/sample_files/invoices/INV-2026-1001.csv"
+    # Test single file path using sample invoice
+    sample_file = "sample_data/sample_invoice.csv"
     assert os.path.exists(sample_file), f"Sample file not found at {sample_file}"
 
     res = client.post(
@@ -31,7 +31,7 @@ def test_direct_file_path_ingest_zero_memory(client, test_tenants, db_session):
     assert res.status_code == 201, res.text
     data = res.json()
     assert data["case_id"] == case.id
-    assert "INV-2026-1001.csv" in data["original_filename"]
+    assert "sample_invoice.csv" in data["original_filename"]
     assert data["category"] == "INVOICE"
     assert data["processing_status"] in ("EXTRACTED", "PENDING")
 
@@ -62,7 +62,7 @@ def test_direct_folder_batch_ingest_zero_memory(client, test_tenants, db_session
     db_session.commit()
     db_session.refresh(case)
 
-    sample_folder = "synthetic_dataset/sample_files/contracts"
+    sample_folder = "sample_data"
     assert os.path.exists(sample_folder), f"Sample folder not found at {sample_folder}"
 
     res = client.post(
